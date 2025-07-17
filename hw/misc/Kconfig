@@ -235,4 +235,10 @@ config IOSB
 config XLNX_VERSAL_TRNG
     bool
 
+config MIPI_CSI2
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+    select MSI_NONBROKEN
+
 source macio/Kconfig

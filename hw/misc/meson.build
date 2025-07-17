@@ -161,3 +161,12 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
 
 # HPPA devices
 system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
+
+# MIPI CSI-2 support
+system_ss.add(when: 'CONFIG_MIPI_CSI2', if_true: files(
+  'csi2_rx_controller.c',
+  'csi2_dphy.c',
+  'csi2_v4l2_bridge.c',
+  'csi2_subsystem.c',
+  'csi2_pcie_device.c',
+))
