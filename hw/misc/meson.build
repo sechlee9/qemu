@@ -169,4 +169,5 @@ system_ss.add(when: 'CONFIG_MIPI_CSI2', if_true: files(
   'csi2_v4l2_bridge.c',
   'csi2_subsystem.c',
   'csi2_pcie_device.c',
+  'csi2_v4l2_integration.c',
 ))

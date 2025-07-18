@@ -126,7 +126,7 @@ static Property csi2_pcie_properties[] = {
     {} /* Empty terminator instead of DEFINE_PROP_END_OF_LIST() */
 };
 
-static void csi2_pcie_class_init(ObjectClass *klass, void *data)
+static void csi2_pcie_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *pc = PCI_DEVICE_CLASS(klass);

@@ -159,7 +159,7 @@ static void csi2_subsystem_instance_init(Object *obj)
     s->v4l2_bridge = NULL;
 }
 
-static void csi2_subsystem_class_init(ObjectClass *klass, void *data)
+static void csi2_subsystem_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     

@@ -168,7 +168,7 @@ static void csi2_v4l2_bridge_instance_init(Object *obj)
     s->csi2_controller = NULL;
 }
 
-static void csi2_v4l2_bridge_class_init(ObjectClass *klass, void *data)
+static void csi2_v4l2_bridge_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     

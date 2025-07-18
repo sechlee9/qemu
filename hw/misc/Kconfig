@@ -241,4 +241,7 @@ config MIPI_CSI2
     depends on PCI
     select MSI_NONBROKEN
 
+config CSI2_DEVICES
+    bool
+    default y
 source macio/Kconfig

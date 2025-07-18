@@ -104,7 +104,7 @@ static void csi2_dphy_instance_init(Object *obj)
     s->enable_deskew = false;
 }
 
-static void csi2_dphy_class_init(ObjectClass *klass, void *data)
+static void csi2_dphy_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     

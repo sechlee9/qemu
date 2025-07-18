@@ -230,7 +230,7 @@ static void csi2_rx_controller_instance_init(Object *obj)
     s->frame_timer = NULL;
 }
 
-static void csi2_rx_controller_class_init(ObjectClass *klass, void *data)
+static void csi2_rx_controller_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     
