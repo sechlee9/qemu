@@ -244,4 +244,12 @@ config MIPI_CSI2
 config CSI2_DEVICES
     bool
     default y
+config CSI2_LOOPBACK
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+config V4L2_BACKEND
+    bool
+    default y if LINUX
+    depends on LINUX
 source macio/Kconfig

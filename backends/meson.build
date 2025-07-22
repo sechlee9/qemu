@@ -42,6 +42,6 @@ endif
 
 system_ss.add(when: 'CONFIG_SPDM_SOCKET', if_true: files('spdm-socket.c'))
 
-system_ss.add(files('v4l2.c'))
+#system_ss.add(files('v4l2.c'))
 
 subdir('tpm')
