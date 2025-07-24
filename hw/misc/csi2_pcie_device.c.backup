@@ -1,0 +1,272 @@
+// hw/misc/csi2_pcie_device.c - MSI-X 추가된 안전한 구현
+#include "qemu/osdep.h"
+#include "hw/pci/pci.h"
+#include "hw/pci/pci_device.h"
+#include "hw/qdev-properties.h"
+#include "qemu/log.h"
+#include "qemu/module.h"
+#include "qemu/timer.h"
+#include "qapi/error.h"
+#include "hw/pci/msix.h"
+
+#define TYPE_CSI2_PCIE_DEVICE "mipi-csi-camera-x86"
+OBJECT_DECLARE_SIMPLE_TYPE(CSI2PCIeDevice, CSI2_PCIE_DEVICE)
+
+#define CSI2_VENDOR_ID    0x1234
+#define CSI2_DEVICE_ID    0x5678
+#define CSI2_MSIX_VECTORS 2
+
+typedef struct CSI2PCIeDevice {
+    PCIDevice parent_obj;
+    MemoryRegion mmio;
+    QEMUTimer *test_timer;
+    
+    /* 상태 */
+    uint32_t test_reg;
+    bool initialized;
+    bool msix_enabled;
+    uint32_t interrupt_count;
+    bool timer_running;
+} CSI2PCIeDevice;
+
+static void csi2_test_timer_cb(void *opaque)
+{
+    CSI2PCIeDevice *dev = CSI2_PCIE_DEVICE(opaque);
+    
+    if (!dev->timer_running) {
+        return;
+    }
+    
+    dev->interrupt_count++;
+    
+    /* MSI-X 인터럽트 전송 */
+    if (dev->msix_enabled && msix_enabled(&dev->parent_obj)) {
+        msix_notify(&dev->parent_obj, 0);  /* 벡터 0 사용 */
+        
+        if (dev->interrupt_count % 10 == 1) {
+            printf("CSI2: MSI-X interrupt sent (count: %d)\n", dev->interrupt_count);
+        }
+    }
+    
+    /* 다음 인터럽트 스케줄링 (1초 간격) */
+    timer_mod(dev->test_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000000);
+}
+
+static uint64_t csi2_pcie_mmio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    CSI2PCIeDevice *dev = CSI2_PCIE_DEVICE(opaque);
+    
+    switch (addr) {
+    case 0x00:
+        return 0xDEADBEEF;  /* 식별용 매직 넘버 */
+    case 0x04:
+        return dev->test_reg;
+    case 0x08:
+        return dev->initialized ? 1 : 0;
+    case 0x0C:
+        return dev->msix_enabled ? 1 : 0;
+    case 0x10:
+        return dev->interrupt_count;
+    case 0x14:
+        return dev->timer_running ? 1 : 0;
+    case 0x18:
+        return msix_enabled(&dev->parent_obj) ? 1 : 0;
+    case 0x1C:
+        return msix_present(&dev->parent_obj) ? 1 : 0;
+    default:
+        return 0;
+    }
+}
+
+static void csi2_pcie_mmio_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
+{
+    CSI2PCIeDevice *dev = CSI2_PCIE_DEVICE(opaque);
+    
+    switch (addr) {
+    case 0x04:
+        dev->test_reg = value;
+        printf("CSI2: Test register written: 0x%lx\n", value);
+        break;
+    case 0x10:
+        /* 인터럽트 카운터 리셋 */
+        if (value == 0) {
+            dev->interrupt_count = 0;
+            printf("CSI2: Interrupt counter reset\n");
+        }
+        break;
+    case 0x14:
+        /* 타이머 제어 */
+        if (value & 1) {
+            if (!dev->timer_running) {
+                dev->timer_running = true;
+                timer_mod(dev->test_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000000);
+                printf("CSI2: Test timer started\n");
+            }
+        } else {
+            if (dev->timer_running) {
+                dev->timer_running = false;
+                timer_del(dev->test_timer);
+                printf("CSI2: Test timer stopped\n");
+            }
+        }
+        break;
+    case 0x18:
+        /* 수동 MSI-X 인터럽트 테스트 */
+        if (value == 0xDEADBEEF && dev->msix_enabled && msix_enabled(&dev->parent_obj)) {
+            msix_notify(&dev->parent_obj, 0);
+            printf("CSI2: Manual MSI-X interrupt sent\n");
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps csi2_pcie_mmio_ops = {
+    .read = csi2_pcie_mmio_read,
+    .write = csi2_pcie_mmio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static void csi2_pcie_realize(PCIDevice *pci_dev, Error **errp)
+{
+    CSI2PCIeDevice *dev = CSI2_PCIE_DEVICE(pci_dev);
+    Error *local_err = NULL;
+    int ret;
+    
+    printf("CSI2: Device initialization started\n");
+    
+    /* 기본 PCI 설정 */
+    pci_config_set_interrupt_pin(pci_dev->config, 1);
+    
+    /* MMIO 영역 설정 (4KB) */
+    memory_region_init_io(&dev->mmio, OBJECT(dev), &csi2_pcie_mmio_ops, dev, 
+                          "csi2-mmio", 0x1000);
+    pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_MEM_TYPE_32, &dev->mmio);
+    printf("CSI2: BAR 0 registered (4KB MMIO)\n");
+    
+    /* MSI-X 초기화 시도 */
+    ret = msix_init_exclusive_bar(pci_dev, CSI2_MSIX_VECTORS, 1, &local_err);
+    if (ret < 0) {
+        printf("CSI2: MSI-X initialization failed: %d, using legacy interrupts\n", ret);
+        if (local_err) {
+            error_free(local_err);
+        }
+        dev->msix_enabled = false;
+    } else {
+        printf("CSI2: MSI-X initialized successfully (%d vectors, BAR 1)\n", CSI2_MSIX_VECTORS);
+        dev->msix_enabled = true;
+    }
+    
+    /* 테스트 타이머 생성 */
+    dev->test_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, csi2_test_timer_cb, dev);
+    if (!dev->test_timer) {
+        error_setg(errp, "CSI2: Failed to create test timer");
+        goto cleanup;
+    }
+    printf("CSI2: Test timer created\n");
+    
+    /* 초기화 완료 */
+    dev->test_reg = 0x12345678;
+    dev->initialized = true;
+    dev->interrupt_count = 0;
+    dev->timer_running = false;
+    
+    printf("CSI2: Device initialized successfully\n");
+    printf("CSI2: MSI-X: %s, Legacy IRQ: Pin A\n", 
+           dev->msix_enabled ? "Available" : "Not available");
+    printf("CSI2: Register Map:\n");
+    printf("  0x00: Magic (0xDEADBEEF)\n");
+    printf("  0x04: Test register (R/W)\n");
+    printf("  0x08: Initialized flag (R)\n");
+    printf("  0x0C: MSI-X enabled (R)\n");
+    printf("  0x10: Interrupt count (R/W - write 0 to reset)\n");
+    printf("  0x14: Timer control (R/W - write 1 to start, 0 to stop)\n");
+    printf("  0x18: Manual interrupt (W - write 0xDEADBEEF to trigger)\n");
+    printf("  0x1C: MSI-X present (R)\n");
+    
+    return;
+
+cleanup:
+    if (dev->msix_enabled && msix_present(pci_dev)) {
+        msix_uninit_exclusive_bar(pci_dev);
+        dev->msix_enabled = false;
+    }
+}
+
+static void csi2_pcie_exit(PCIDevice *pci_dev)
+{
+    CSI2PCIeDevice *dev = CSI2_PCIE_DEVICE(pci_dev);
+    
+    printf("CSI2: Device cleanup started\n");
+    
+    dev->timer_running = false;
+    
+    if (dev->test_timer) {
+        timer_del(dev->test_timer);
+        timer_free(dev->test_timer);
+        dev->test_timer = NULL;
+    }
+    
+    if (dev->msix_enabled && msix_present(pci_dev)) {
+        msix_uninit_exclusive_bar(pci_dev);
+        dev->msix_enabled = false;
+        printf("CSI2: MSI-X cleaned up\n");
+    }
+    
+    printf("CSI2: Device cleanup completed\n");
+}
+
+static void csi2_pcie_reset(DeviceState *qdev)
+{
+    CSI2PCIeDevice *dev = CSI2_PCIE_DEVICE(qdev);
+    
+    if (dev->test_timer) {
+        timer_del(dev->test_timer);
+    }
+    
+    dev->test_reg = 0x12345678;
+    dev->interrupt_count = 0;
+    dev->timer_running = false;
+    
+    printf("CSI2: Device reset completed\n");
+}
+
+static void csi2_pcie_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *pc = PCI_DEVICE_CLASS(klass);
+    
+    pc->realize = csi2_pcie_realize;
+    pc->exit = csi2_pcie_exit;
+    pc->vendor_id = CSI2_VENDOR_ID;
+    pc->device_id = CSI2_DEVICE_ID;
+    pc->class_id = 0x0400;  /* Multimedia controller */
+    pc->revision = 0x01;
+    
+    dc->desc = "MIPI CSI-2 PCIe Camera Device (Minimal)";
+    device_class_set_legacy_reset(dc, csi2_pcie_reset);
+    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+}
+
+static const TypeInfo csi2_pcie_info = {
+    .name = TYPE_CSI2_PCIE_DEVICE,
+    .parent = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(CSI2PCIeDevice),
+    .class_init = csi2_pcie_class_init,
+    .interfaces = (InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
+};
+
+static void csi2_pcie_register_types(void)
+{
+    type_register_static(&csi2_pcie_info);
+}
+
+type_init(csi2_pcie_register_types)

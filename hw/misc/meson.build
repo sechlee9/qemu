@@ -168,12 +168,13 @@ system_ss.add(when: 'CONFIG_MIPI_CSI2', if_true: files(
   #'csi2_dphy.c',
   'csi2_v4l2_bridge.c',
   #'csi2_subsystem.c',
-  #'csi2_pcie_device.c',
-  'csi2_v4l2_integration.c',
+  'csi2_pcie_device.c',
+  #'csi2_v4l2_integration.c',
   #'csi2_unified.c',
   #'csi2_v4l2_simplified.c',
   'v4l2_backend.c',
-  'csi2_frontend.c',
+  #'csi2_frontend.c',
+  #'csi2_msix_common.c'
 ))
 
 # MIPI CSI-2 V4L2 Loopback support - New implementation

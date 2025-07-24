@@ -1,4 +1,3 @@
-// hw/misc/csi2_v4l2_loopback_pcie.c - CSI2 Sink with Virtual Source
 #include "qemu/osdep.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
@@ -19,35 +18,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(CSI2V4L2LoopbackPCIe, CSI2_V4L2_LOOPBACK_PCIE)
 #define CSI2_DEVICE_ID    0x5679
 #define CSI2_MSIX_VECTORS 4
 
-// Virtual Source Types (내장된 가상 카메라 소스)
-typedef enum {
-    CSI2_VIRTUAL_SOURCE_NONE = 0,
-    CSI2_VIRTUAL_SOURCE_TEST_PATTERN,
-    CSI2_VIRTUAL_SOURCE_COLOR_BARS,
-    CSI2_VIRTUAL_SOURCE_MOVING_PATTERN,
-    CSI2_VIRTUAL_SOURCE_NOISE,
-    CSI2_VIRTUAL_SOURCE_GRADIENT
-} CSI2VirtualSourceType;
-
 typedef struct CSI2V4L2LoopbackPCIe {
     PCIDevice parent_obj;
     MemoryRegion mmio;
     QEMUTimer *frame_timer;
     
-    /* CSI2 Sink Device State */
+    /* CSI2 simulation state */
     uint32_t core_config;
     uint32_t core_status;
     uint32_t sequence_number;
     uint32_t frames_captured;
     bool streaming_active;
     
-    /* Virtual Source (내장된 가상 카메라) */
-    CSI2VirtualSourceType virtual_source_type;
-    uint32_t virtual_source_pattern;
-    bool virtual_source_enabled;
-    uint32_t virtual_source_fps;
-    
-    /* V4L2 loopback state (Sink Output) */
+    /* V4L2 loopback state */
     int v4l2_fd;
     char *v4l2_device_path;
     bool v4l2_initialized;
@@ -82,7 +65,7 @@ static char *find_v4l2_loopback_device(void)
                     if (strstr((char*)cap.driver, "v4l2 loopback") ||
                         strstr((char*)cap.card, "Dummy video device")) {
                         close(fd);
-                        printf("CSI2-Sink: Found V4L2 loopback device: %s (%s)\n", 
+                        printf("CSI2-V4L2: Found loopback device: %s (%s)\n", 
                                device_path, cap.card);
                         return g_strdup(device_path);
                     }
@@ -92,11 +75,11 @@ static char *find_v4l2_loopback_device(void)
         }
     }
     
-    printf("CSI2-Sink: No V4L2 loopback device found\n");
+    printf("CSI2-V4L2: No v4l2loopback device found\n");
     return NULL;
 }
 
-// Initialize V4L2 loopback device (Sink Output)
+// Initialize V4L2 loopback device
 static int csi2_init_v4l2_loopback(CSI2V4L2LoopbackPCIe *dev)
 {
     struct v4l2_format fmt;
@@ -110,7 +93,7 @@ static int csi2_init_v4l2_loopback(CSI2V4L2LoopbackPCIe *dev)
     // Open V4L2 device
     dev->v4l2_fd = open(dev->v4l2_device_path, O_RDWR | O_NONBLOCK);
     if (dev->v4l2_fd < 0) {
-        printf("CSI2-Sink: Failed to open %s: %s\n", 
+        printf("CSI2-V4L2: Failed to open %s: %s\n", 
                dev->v4l2_device_path, strerror(errno));
         g_free(dev->v4l2_device_path);
         dev->v4l2_device_path = NULL;
@@ -129,7 +112,7 @@ static int csi2_init_v4l2_loopback(CSI2V4L2LoopbackPCIe *dev)
     fmt.fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
     
     if (ioctl(dev->v4l2_fd, VIDIOC_S_FMT, &fmt) < 0) {
-        printf("CSI2-Sink: Failed to set format: %s\n", strerror(errno));
+        printf("CSI2-V4L2: Failed to set format: %s\n", strerror(errno));
         close(dev->v4l2_fd);
         dev->v4l2_fd = -1;
         g_free(dev->v4l2_device_path);
@@ -137,143 +120,45 @@ static int csi2_init_v4l2_loopback(CSI2V4L2LoopbackPCIe *dev)
         return -1;
     }
     
-    printf("CSI2-Sink: V4L2 output configured: %dx%d RGB24 on %s\n", 
+    printf("CSI2-V4L2: V4L2 format set: %dx%d RGB24 on %s\n", 
            fmt.fmt.pix.width, fmt.fmt.pix.height, dev->v4l2_device_path);
     
     dev->v4l2_initialized = true;
     return 0;
 }
 
-// Virtual Source Frame Generation Functions
-static void generate_test_pattern(CSI2V4L2LoopbackPCIe *dev)
+// Generate and write test frame
+static void csi2_generate_and_write_frame(CSI2V4L2LoopbackPCIe *dev)
 {
-    uint8_t *buf = dev->frame_buffer;
-    uint32_t counter = dev->sequence_number % 256;
-    
-    for (uint32_t y = 0; y < dev->frame_height; y++) {
-        for (uint32_t x = 0; x < dev->frame_width; x++) {
-            uint32_t offset = (y * dev->frame_width + x) * 3;
-            buf[offset + 0] = (x + counter) % 256;        // R
-            buf[offset + 1] = (y + counter) % 256;        // G
-            buf[offset + 2] = (x + y + counter) % 256;    // B
-        }
-    }
-}
-
-static void generate_color_bars(CSI2V4L2LoopbackPCIe *dev)
-{
-    uint8_t *buf = dev->frame_buffer;
-    
-    for (uint32_t y = 0; y < dev->frame_height; y++) {
-        for (uint32_t x = 0; x < dev->frame_width; x++) {
-            uint32_t offset = (y * dev->frame_width + x) * 3;
-            uint32_t bar = (x * 8) / dev->frame_width;
-            buf[offset + 0] = (bar & 1) ? 255 : 0;        // R
-            buf[offset + 1] = (bar & 2) ? 255 : 0;        // G
-            buf[offset + 2] = (bar & 4) ? 255 : 0;        // B
-        }
-    }
-}
-
-static void generate_moving_pattern(CSI2V4L2LoopbackPCIe *dev)
-{
-    uint8_t *buf = dev->frame_buffer;
-    uint32_t counter = dev->sequence_number;
-    
-    for (uint32_t y = 0; y < dev->frame_height; y++) {
-        for (uint32_t x = 0; x < dev->frame_width; x++) {
-            uint32_t offset = (y * dev->frame_width + x) * 3;
-            uint32_t wave = ((x + counter * 2) % 64) < 32 ? 255 : 0;
-            buf[offset + 0] = wave;                       // R
-            buf[offset + 1] = wave;                       // G
-            buf[offset + 2] = wave;                       // B
-        }
-    }
-}
-
-static void generate_gradient(CSI2V4L2LoopbackPCIe *dev)
-{
-    uint8_t *buf = dev->frame_buffer;
-    
-    for (uint32_t y = 0; y < dev->frame_height; y++) {
-        for (uint32_t x = 0; x < dev->frame_width; x++) {
-            uint32_t offset = (y * dev->frame_width + x) * 3;
-            buf[offset + 0] = (x * 255) / dev->frame_width;     // R
-            buf[offset + 1] = (y * 255) / dev->frame_height;    // G
-            buf[offset + 2] = ((x + y) * 255) / (dev->frame_width + dev->frame_height); // B
-        }
-    }
-}
-
-static void generate_noise(CSI2V4L2LoopbackPCIe *dev)
-{
-    uint8_t *buf = dev->frame_buffer;
-    static uint32_t seed = 12345;
-    
-    for (uint32_t y = 0; y < dev->frame_height; y++) {
-        for (uint32_t x = 0; x < dev->frame_width; x++) {
-            uint32_t offset = (y * dev->frame_width + x) * 3;
-            // Simple PRNG
-            seed = seed * 1103515245 + 12345;
-            buf[offset + 0] = (seed >> 16) & 0xFF;        // R
-            buf[offset + 1] = (seed >> 8) & 0xFF;         // G
-            buf[offset + 2] = seed & 0xFF;                // B
-        }
-    }
-}
-
-// Virtual Source Frame Reception Simulation
-static void csi2_virtual_source_generate_frame(CSI2V4L2LoopbackPCIe *dev)
-{
-    if (!dev->virtual_source_enabled || !dev->frame_buffer) {
+    if (!dev->frame_buffer || !dev->v4l2_initialized || dev->v4l2_fd < 0) {
         return;
     }
     
-    switch (dev->virtual_source_type) {
-    case CSI2_VIRTUAL_SOURCE_TEST_PATTERN:
-        generate_test_pattern(dev);
-        break;
-    case CSI2_VIRTUAL_SOURCE_COLOR_BARS:
-        generate_color_bars(dev);
-        break;
-    case CSI2_VIRTUAL_SOURCE_MOVING_PATTERN:
-        generate_moving_pattern(dev);
-        break;
-    case CSI2_VIRTUAL_SOURCE_GRADIENT:
-        generate_gradient(dev);
-        break;
-    case CSI2_VIRTUAL_SOURCE_NOISE:
-        generate_noise(dev);
-        break;
-    default:
-        generate_test_pattern(dev);
-        break;
-    }
-}
-
-// Output frame to V4L2 loopback (Sink Output)
-static void csi2_output_frame_to_v4l2(CSI2V4L2LoopbackPCIe *dev)
-{
-    if (!dev->v4l2_initialized || dev->v4l2_fd < 0) {
-        return;
+    uint8_t *buf = dev->frame_buffer;
+    uint32_t frame_counter = dev->sequence_number % 256;
+    
+    // Generate simple test pattern
+    for (uint32_t y = 0; y < dev->frame_height; y++) {
+        for (uint32_t x = 0; x < dev->frame_width; x++) {
+            uint32_t offset = (y * dev->frame_width + x) * 3;
+            buf[offset + 0] = (x + frame_counter) % 256;        // R
+            buf[offset + 1] = (y + frame_counter) % 256;        // G
+            buf[offset + 2] = (x + y + frame_counter) % 256;    // B
+        }
     }
     
-    // Write frame to V4L2 loopback device
+    // Write to V4L2 loopback device
     ssize_t written = write(dev->v4l2_fd, dev->frame_buffer, dev->frame_buffer_size);
     if (written == (ssize_t)dev->frame_buffer_size) {
+        dev->frames_captured++;
         if (dev->frames_captured % 30 == 1) {
-            printf("CSI2-Sink: Output frame %d to %s (source: %s)\n", 
-                   dev->frames_captured, dev->v4l2_device_path,
-                   dev->virtual_source_type == CSI2_VIRTUAL_SOURCE_TEST_PATTERN ? "test pattern" :
-                   dev->virtual_source_type == CSI2_VIRTUAL_SOURCE_COLOR_BARS ? "color bars" :
-                   dev->virtual_source_type == CSI2_VIRTUAL_SOURCE_MOVING_PATTERN ? "moving pattern" :
-                   dev->virtual_source_type == CSI2_VIRTUAL_SOURCE_GRADIENT ? "gradient" :
-                   dev->virtual_source_type == CSI2_VIRTUAL_SOURCE_NOISE ? "noise" : "unknown");
+            printf("CSI2-V4L2: Wrote frame %d to %s\n", 
+                   dev->frames_captured, dev->v4l2_device_path);
         }
     }
 }
 
-// Frame timer callback (CSI2 Sink Frame Reception Simulation)
+// Frame timer callback
 static void csi2_frame_timer_cb(void *opaque)
 {
     CSI2V4L2LoopbackPCIe *dev = CSI2_V4L2_LOOPBACK_PCIE(opaque);
@@ -282,35 +167,24 @@ static void csi2_frame_timer_cb(void *opaque)
         return;
     }
     
+    dev->interrupt_count++;
     dev->sequence_number++;
+    dev->frames_captured++;
     
-    // Simulate frame reception from virtual source
-    csi2_virtual_source_generate_frame(dev);
+    // Update core status
+    dev->core_status = (dev->sequence_number << 16) & 0xFFFF0000;
     
-    // Process received frame (sink functionality)
-    if (dev->virtual_source_enabled) {
-        dev->frames_captured++;
-        dev->interrupt_count++;
+    // Generate and write frame to V4L2 loopback
+    csi2_generate_and_write_frame(dev);
+    
+    // Send MSI-X interrupt
+    if (dev->msix_enabled && msix_enabled(&dev->parent_obj)) {
+        msix_notify(&dev->parent_obj, 0);  // Use vector 0
         
-        // Update core status
-        dev->core_status = (dev->sequence_number << 16) & 0xFFFF0000;
-        
-        // Output frame to V4L2 loopback (sink output)
-        csi2_output_frame_to_v4l2(dev);
-        
-        // Generate interrupt (frame received)
-        if (dev->msix_enabled && msix_enabled(&dev->parent_obj)) {
-            msix_notify(&dev->parent_obj, 0);  // Use vector 0
-            
-            if (dev->interrupt_count % 30 == 1) {
-                printf("CSI2-Sink: Received frame %d from virtual source (type: %d)\n", 
-                       dev->frames_captured, dev->virtual_source_type);
-            }
+        if (dev->interrupt_count % 30 == 1) {
+            printf("CSI2-V4L2: MSI-X frame interrupt sent (count: %d)\n", 
+                   dev->interrupt_count);
         }
-    } else {
-        // No virtual source - just increment counters for timing
-        dev->interrupt_count++;
-        dev->core_status = (dev->sequence_number << 16) & 0xFFFF0000;
     }
     
     // Schedule next frame
@@ -336,11 +210,11 @@ static uint64_t csi2_mmio_read(void *opaque, hwaddr addr, unsigned size)
         return dev->msix_enabled ? 1 : 0;
     case 0x14: /* Interrupt count */
         return dev->interrupt_count;
-    case 0x18: /* Streaming active */
-        return dev->streaming_active ? 1 : 0;
+    case 0x18: /* Timer running */
+        return dev->streaming_active ? 1 : 0; //return dev->timer_running ? 1 : 0;
     case 0x1C: /* MSI-X present */
         return msix_present(&dev->parent_obj) ? 1 : 0;
-    case 0x20: /* Streaming active (alias) */
+    case 0x20: /* Streaming active */
         return dev->streaming_active ? 1 : 0;
     case 0x24: /* Sequence number */
         return dev->sequence_number;
@@ -352,14 +226,6 @@ static uint64_t csi2_mmio_read(void *opaque, hwaddr addr, unsigned size)
         return (dev->frame_width << 16) | dev->frame_height;
     case 0x34: /* FPS */
         return dev->fps;
-    case 0x38: /* Virtual source type */
-        return dev->virtual_source_type;
-    case 0x3C: /* Virtual source enabled */
-        return dev->virtual_source_enabled ? 1 : 0;
-    case 0x40: /* Virtual source pattern */
-        return dev->virtual_source_pattern;
-    case 0x44: /* Virtual source FPS */
-        return dev->virtual_source_fps;
     default:
         return 0;
     }
@@ -373,15 +239,15 @@ static void csi2_mmio_write(void *opaque, hwaddr addr, uint64_t value, unsigned 
     switch (addr) {
     case 0x04: /* Core config */
         dev->core_config = value & 0x7;
-        printf("CSI2-Sink: Core config written: 0x%lx\n", value);
+        printf("CSI2-V4L2: Core config written: 0x%lx\n", value);
         break;
     case 0x14: /* Interrupt counter reset */
         if (value == 0) {
             dev->interrupt_count = 0;
-            printf("CSI2-Sink: Interrupt counter reset\n");
+            printf("CSI2-V4L2: Interrupt counter reset\n");
         }
         break;
-    case 0x18: /* Streaming control */
+    case 0x18: /* Timer control */
         if (value & 1) {
             if (!dev->timer_running) {
                 dev->timer_running = true;
@@ -389,66 +255,39 @@ static void csi2_mmio_write(void *opaque, hwaddr addr, uint64_t value, unsigned 
                 dev->sequence_number = 0;
                 dev->frames_captured = 0;
                 timer_mod(dev->frame_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 33333333);
-                printf("CSI2-Sink: Streaming started (%dx%d @ %d fps, virtual source: %s)\n", 
-                       dev->frame_width, dev->frame_height, dev->fps,
-                       dev->virtual_source_enabled ? "enabled" : "disabled");
+                printf("CSI2-V4L2: Streaming started (%dx%d @ %d fps)\n", 
+                       dev->frame_width, dev->frame_height, dev->fps);
             }
         } else {
             if (dev->timer_running) {
                 dev->timer_running = false;
                 dev->streaming_active = false;
                 timer_del(dev->frame_timer);
-                printf("CSI2-Sink: Streaming stopped\n");
+                printf("CSI2-V4L2: Streaming stopped\n");
             }
         }
         break;
     case 0x1C: /* Manual MSI-X interrupt test */
         if (value == 0xDEADBEEF) {
-            dev->interrupt_count++;
-            if (dev->msix_enabled && msix_enabled(&dev->parent_obj)) {
-                msix_notify(&dev->parent_obj, 1);  // Use vector 1 for test
-                printf("CSI2-Sink: Manual interrupt triggered (count: %d)\n", 
-                       dev->interrupt_count);
-            }
+		dev->interrupt_count++;
+		if(dev->msix_enabled && msix_enabled(&dev->parent_obj)) {
+			msix_notify(&dev->parent_obj, 1);  // Use vector 1 for test
+		        printf("CSI2-V4L2: Manual MSI-X interrupt sent (count: %d)\n", dev->interrupt_count);
+		} else {
+			printf("CSI2-V4L2: Manual interrupt triggered (count: %d)\n", dev->interrupt_count);
+		}
         }
         break;
     case 0x24: /* Sequence number reset */
         if (value == 0) {
             dev->sequence_number = 0;
-            printf("CSI2-Sink: Sequence number reset\n");
+            printf("CSI2-V4L2: Sequence number reset\n");
         }
         break;
     case 0x28: /* Frames captured reset */
         if (value == 0) {
             dev->frames_captured = 0;
-            printf("CSI2-Sink: Frames captured reset\n");
-        }
-        break;
-    case 0x38: /* Virtual source type */
-        if (value <= CSI2_VIRTUAL_SOURCE_GRADIENT) {
-            dev->virtual_source_type = value;
-            printf("CSI2-Sink: Virtual source type set to %ld (%s)\n", value,
-                   value == CSI2_VIRTUAL_SOURCE_NONE ? "none" :
-                   value == CSI2_VIRTUAL_SOURCE_TEST_PATTERN ? "test pattern" :
-                   value == CSI2_VIRTUAL_SOURCE_COLOR_BARS ? "color bars" :
-                   value == CSI2_VIRTUAL_SOURCE_MOVING_PATTERN ? "moving pattern" :
-                   value == CSI2_VIRTUAL_SOURCE_GRADIENT ? "gradient" :
-                   value == CSI2_VIRTUAL_SOURCE_NOISE ? "noise" : "unknown");
-        }
-        break;
-    case 0x3C: /* Virtual source enable */
-        dev->virtual_source_enabled = (value & 1) != 0;
-        printf("CSI2-Sink: Virtual source %s\n", 
-               dev->virtual_source_enabled ? "enabled" : "disabled");
-        break;
-    case 0x40: /* Virtual source pattern */
-        dev->virtual_source_pattern = value;
-        printf("CSI2-Sink: Virtual source pattern set to %ld\n", value);
-        break;
-    case 0x44: /* Virtual source FPS */
-        if (value > 0 && value <= 120) {
-            dev->virtual_source_fps = value;
-            printf("CSI2-Sink: Virtual source FPS set to %ld\n", value);
+            printf("CSI2-V4L2: Frames captured reset\n");
         }
         break;
     default:
@@ -473,37 +312,37 @@ static void csi2_pcie_realize(PCIDevice *pci_dev, Error **errp)
     Error *local_err = NULL;
     int ret;
     
-    printf("CSI2-Sink: Device initialization started\n");
+    printf("CSI2-V4L2: Device initialization started\n");
     
     /* Basic PCI setup */
     pci_config_set_interrupt_pin(pci_dev->config, 1);
     
     /* MMIO region setup (4KB) */
     memory_region_init_io(&dev->mmio, OBJECT(dev), &csi2_mmio_ops, dev, 
-                          "csi2-sink-mmio", 0x1000);
+                          "csi2-v4l2-mmio", 0x1000);
     pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_MEM_TYPE_32, &dev->mmio);
-    printf("CSI2-Sink: BAR 0 registered (4KB MMIO)\n");
+    printf("CSI2-V4L2: BAR 0 registered (4KB MMIO)\n");
     
-    /* MSI-X initialization */
+    /* MSI-X initialization attempt */
     ret = msix_init_exclusive_bar(pci_dev, CSI2_MSIX_VECTORS, 1, &local_err);
     if (ret < 0) {
-        printf("CSI2-Sink: MSI-X initialization failed: %d, using legacy interrupts\n", ret);
+        printf("CSI2-V4L2: MSI-X initialization failed: %d, using legacy interrupts\n", ret);
         if (local_err) {
             error_free(local_err);
         }
         dev->msix_enabled = false;
     } else {
-        printf("CSI2-Sink: MSI-X initialized successfully (%d vectors, BAR 1)\n", CSI2_MSIX_VECTORS);
+        printf("CSI2-V4L2: MSI-X initialized successfully (%d vectors, BAR 1)\n", CSI2_MSIX_VECTORS);
         dev->msix_enabled = true;
     }
     
     /* Frame timer creation */
     dev->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, csi2_frame_timer_cb, dev);
     if (!dev->frame_timer) {
-        error_setg(errp, "CSI2-Sink: Failed to create frame timer");
+        error_setg(errp, "CSI2-V4L2: Failed to create frame timer");
         goto cleanup;
     }
-    printf("CSI2-Sink: Frame reception timer created\n");
+    printf("CSI2-V4L2: Frame timer created\n");
     
     /* Frame configuration */
     dev->frame_width = 1280;
@@ -514,27 +353,20 @@ static void csi2_pcie_realize(PCIDevice *pci_dev, Error **errp)
     /* Allocate frame buffer */
     dev->frame_buffer = g_malloc(dev->frame_buffer_size);
     if (!dev->frame_buffer) {
-        error_setg(errp, "CSI2-Sink: Failed to allocate frame buffer");
+        error_setg(errp, "CSI2-V4L2: Failed to allocate frame buffer");
         goto cleanup;
     }
-    printf("CSI2-Sink: Frame buffer allocated (%zu bytes)\n", dev->frame_buffer_size);
+    printf("CSI2-V4L2: Frame buffer allocated (%zu bytes)\n", dev->frame_buffer_size);
     
-    /* Initialize Virtual Source */
-    dev->virtual_source_type = CSI2_VIRTUAL_SOURCE_TEST_PATTERN;
-    dev->virtual_source_enabled = true;  // Enabled by default for testing
-    dev->virtual_source_pattern = 0;
-    dev->virtual_source_fps = 30;
-    printf("CSI2-Sink: Virtual source initialized (type: test pattern, enabled: yes)\n");
-    
-    /* Initialize V4L2 loopback (Sink Output) */
+    /* Initialize V4L2 loopback */
     dev->v4l2_fd = -1;
     dev->v4l2_device_path = NULL;
     dev->v4l2_initialized = false;
     
     if (csi2_init_v4l2_loopback(dev) == 0) {
-        printf("CSI2-Sink: V4L2 output initialized successfully\n");
+        printf("CSI2-V4L2: V4L2 loopback initialized successfully\n");
     } else {
-        printf("CSI2-Sink: V4L2 output initialization failed, running without V4L2 output\n");
+        printf("CSI2-V4L2: V4L2 loopback initialization failed, running in CSI2-only mode\n");
     }
     
     /* Initialize device state */
@@ -547,15 +379,12 @@ static void csi2_pcie_realize(PCIDevice *pci_dev, Error **errp)
     dev->interrupt_count = 0;
     dev->timer_running = false;
     
-    printf("CSI2-Sink: Device initialized successfully\n");
-    printf("CSI2-Sink: Type: CSI2 Sink Device with Virtual Source\n");
-    printf("CSI2-Sink: MSI-X: %s, Legacy IRQ: Pin A\n", 
+    printf("CSI2-V4L2: Device initialized successfully\n");
+    printf("CSI2-V4L2: MSI-X: %s, Legacy IRQ: Pin A\n", 
            dev->msix_enabled ? "Available" : "Not available");
-    printf("CSI2-Sink: V4L2 output: %s\n",
+    printf("CSI2-V4L2: V4L2 loopback: %s\n",
            dev->v4l2_initialized ? dev->v4l2_device_path : "Not available");
-    printf("CSI2-Sink: Virtual source: %s\n",
-           dev->virtual_source_enabled ? "Enabled" : "Disabled");
-    printf("CSI2-Sink: Register Map:\n");
+    printf("CSI2-V4L2: Register Map:\n");
     printf("  0x00: Magic (0xDEADBEEF)\n");
     printf("  0x04: Core config (R/W)\n");
     printf("  0x08: Core status (R)\n");
@@ -566,9 +395,6 @@ static void csi2_pcie_realize(PCIDevice *pci_dev, Error **errp)
     printf("  0x24: Sequence number (R/W - write 0 to reset)\n");
     printf("  0x28: Frames captured (R/W - write 0 to reset)\n");
     printf("  0x30: Frame config (R - width<<16 | height)\n");
-    printf("  0x38: Virtual source type (R/W - 0:none, 1:test, 2:bars, 3:moving, 4:noise, 5:gradient)\n");
-    printf("  0x3C: Virtual source enabled (R/W - 1:enabled, 0:disabled)\n");
-    printf("  0x40: Virtual source pattern (R/W)\n");
     
     return;
 
@@ -588,7 +414,7 @@ static void csi2_pcie_exit(PCIDevice *pci_dev)
 {
     CSI2V4L2LoopbackPCIe *dev = CSI2_V4L2_LOOPBACK_PCIE(pci_dev);
     
-    printf("CSI2-Sink: Device cleanup started\n");
+    printf("CSI2-V4L2: Device cleanup started\n");
     
     dev->timer_running = false;
     dev->streaming_active = false;
@@ -614,10 +440,10 @@ static void csi2_pcie_exit(PCIDevice *pci_dev)
     if (dev->msix_enabled && msix_present(pci_dev)) {
         msix_uninit_exclusive_bar(pci_dev);
         dev->msix_enabled = false;
-        printf("CSI2-Sink: MSI-X cleaned up\n");
+        printf("CSI2-V4L2: MSI-X cleaned up\n");
     }
     
-    printf("CSI2-Sink: Device cleanup completed\n");
+    printf("CSI2-V4L2: Device cleanup completed\n");
 }
 
 // Device reset
@@ -637,12 +463,7 @@ static void csi2_pcie_reset(DeviceState *qdev)
     dev->timer_running = false;
     dev->streaming_active = false;
     
-    // Reset virtual source to default
-    dev->virtual_source_type = CSI2_VIRTUAL_SOURCE_TEST_PATTERN;
-    dev->virtual_source_enabled = true;
-    dev->virtual_source_pattern = 0;
-    
-    printf("CSI2-Sink: Device reset completed\n");
+    printf("CSI2-V4L2: Device reset completed\n");
 }
 
 // Device properties
@@ -650,8 +471,6 @@ static Property csi2_pcie_properties[] = {
     DEFINE_PROP_UINT32("frame-width", CSI2V4L2LoopbackPCIe, frame_width, 1280),
     DEFINE_PROP_UINT32("frame-height", CSI2V4L2LoopbackPCIe, frame_height, 720),
     DEFINE_PROP_UINT32("fps", CSI2V4L2LoopbackPCIe, fps, 30),
-    DEFINE_PROP_UINT32("virtual-source-type", CSI2V4L2LoopbackPCIe, virtual_source_type, CSI2_VIRTUAL_SOURCE_TEST_PATTERN),
-    DEFINE_PROP_BOOL("virtual-source-enabled", CSI2V4L2LoopbackPCIe, virtual_source_enabled, true),
     { }
 };
 
@@ -668,7 +487,7 @@ static void csi2_pcie_class_init(ObjectClass *klass, const void *data)
     pc->class_id = 0x0400;  /* Multimedia controller */
     pc->revision = 0x01;
     
-    dc->desc = "MIPI CSI-2 Sink Device with Virtual Source and V4L2 Output";
+    dc->desc = "MIPI CSI-2 PCIe Device with V4L2 Loopback (Simple)";
     device_class_set_legacy_reset(dc, csi2_pcie_reset);
     dc->props_ = csi2_pcie_properties;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);

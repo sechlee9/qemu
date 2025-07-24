@@ -12,6 +12,7 @@
 #include "qapi/error.h"
 #include "include/hw/misc/csi2_rx_controller.h"
 #include "include/hw/misc/csi2_v4l2_bridge.h"
+#include "include/hw/misc/csi2_msix_common.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -30,7 +31,10 @@ typedef enum {
 typedef struct CSI2AdaptiveDevice {
     PCIDevice parent_obj;
     MemoryRegion mmio;
-    
+
+    /* MSI-X 상태 */
+    CSI2MSIXState msix_state;
+
     /* Sub-components */
     CSI2RxController *csi2_controller;
     CSI2V4L2Bridge *v4l2_bridge;

@@ -1,4 +1,4 @@
-// vsync_kernel_6_15_driver.c - QEMU CSI2 V4L2 통합 커널 드라이버 (Missing IOCTLs 추가)
+// fixed_qemu_csi2_v4l2.c - V4L2 디바이스 등록 문제 수정 버전
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -35,6 +35,11 @@
 #define V4L2_REG_FRAMES_CAPTURED    0x2004
 #define V4L2_REG_SEQUENCE_NUMBER    0x2008
 
+// MSI-X 벡터 수
+#define CSI2_MSIX_VECTORS 2
+#define CSI2_MSIX_FRAME_VEC 0
+#define CSI2_MSIX_ERROR_VEC 1
+
 // 최대 버퍼 수
 #define MAX_BUFFERS 32
 
@@ -51,15 +56,16 @@ struct csi2_buffer {
 struct csi2_v4l2_device {
     struct pci_dev *pdev;
     struct v4l2_device v4l2_dev;
-    struct video_device vdev;
+    struct video_device vdev;  // 정적 할당으로 변경
     struct v4l2_ctrl_handler ctrl_handler;
     
     // MMIO
     void __iomem *mmio_base;
     resource_size_t mmio_len;
     
-    // IRQ
-    int irq;
+    // MSI-X
+    struct msix_entry msix_entries[CSI2_MSIX_VECTORS];
+    bool msix_enabled;
     
     // Video buffer queue
     struct vb2_queue queue;
@@ -86,6 +92,8 @@ struct csi2_v4l2_device {
     
     // Device state
     bool initialized;
+    bool v4l2_registered;
+    bool use_legacy_irq;  // MSI-X 실패시 legacy IRQ 사용
 };
 
 // Forward declarations
@@ -131,8 +139,6 @@ static int csi2_vidioc_streamon(struct file *file, void *priv,
                                 enum v4l2_buf_type type);
 static int csi2_vidioc_streamoff(struct file *file, void *priv,
                                  enum v4l2_buf_type type);
-
-// Missing IOCTLs - 추가된 부분
 static int csi2_vidioc_g_input(struct file *file, void *priv, unsigned int *i);
 static int csi2_vidioc_s_input(struct file *file, void *priv, unsigned int i);
 static int csi2_vidioc_enum_input(struct file *file, void *priv, struct v4l2_input *inp);
@@ -152,7 +158,6 @@ static const struct v4l2_ioctl_ops csi2_ioctl_ops = {
     .vidioc_dqbuf = csi2_vidioc_dqbuf,
     .vidioc_streamon = csi2_vidioc_streamon,
     .vidioc_streamoff = csi2_vidioc_streamoff,
-    // Missing IOCTLs 추가
     .vidioc_g_input = csi2_vidioc_g_input,
     .vidioc_s_input = csi2_vidioc_s_input,
     .vidioc_enum_input = csi2_vidioc_enum_input,
@@ -280,7 +285,7 @@ static void csi2_vb2_stop_streaming(struct vb2_queue *vq)
     dev->streaming = false;
     
     // Stop frame generation
-    timer_delete_sync(&dev->frame_timer);  // Linux 6.15+ 호환
+    timer_delete_sync(&dev->frame_timer);
     flush_workqueue(dev->frame_wq);
     
     // Disable V4L2 bridge in QEMU
@@ -374,7 +379,7 @@ static int csi2_vidioc_querycap(struct file *file, void *priv,
     
     cap->capabilities = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE | 
                        V4L2_CAP_STREAMING | V4L2_CAP_DEVICE_CAPS;
-    cap->device_caps = cap->capabilities;
+    cap->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE | V4L2_CAP_STREAMING;
     
     return 0;
 }
@@ -477,10 +482,9 @@ static int csi2_vidioc_streamoff(struct file *file, void *priv,
     return vb2_streamoff(&dev->queue, type);
 }
 
-// Missing IOCTL implementations - 추가된 부분
 static int csi2_vidioc_g_input(struct file *file, void *priv, unsigned int *i)
 {
-    *i = 0;  // Single input device
+    *i = 0;
     return 0;
 }
 
@@ -498,7 +502,7 @@ static int csi2_vidioc_enum_input(struct file *file, void *priv, struct v4l2_inp
     
     strscpy(inp->name, "QEMU CSI2 Camera", sizeof(inp->name));
     inp->type = V4L2_INPUT_TYPE_CAMERA;
-    inp->status = 0;  // Signal present
+    inp->status = 0;
     inp->capabilities = 0;
     
     return 0;
@@ -522,8 +526,6 @@ static int csi2_vidioc_s_parm(struct file *file, void *priv, struct v4l2_streamp
     if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
         return -EINVAL;
     
-    // For simplicity, we don't actually change the frame rate
-    // Just return the current parameters
     return csi2_vidioc_g_parm(file, priv, parm);
 }
 
@@ -532,6 +534,8 @@ static int csi2_open(struct file *file)
 {
     struct csi2_v4l2_device *dev = video_drvdata(file);
     int ret;
+    
+    dev_info(&dev->pdev->dev, "Device opening...\n");
     
     mutex_lock(&dev->dev_lock);
     
@@ -542,13 +546,12 @@ static int csi2_open(struct file *file)
     }
     
     if (v4l2_fh_is_singular_file(file)) {
-        // Reset device state
         atomic_set(&dev->sequence, 0);
         atomic_set(&dev->frames_generated, 0);
         atomic_set(&dev->frames_dropped, 0);
     }
     
-    dev_info(&dev->pdev->dev, "Device opened\n");
+    dev_info(&dev->pdev->dev, "Device opened successfully\n");
 
 unlock:
     mutex_unlock(&dev->dev_lock);
@@ -559,6 +562,8 @@ static int csi2_release(struct file *file)
 {
     struct csi2_v4l2_device *dev = video_drvdata(file);
     int ret;
+    
+    dev_info(&dev->pdev->dev, "Device closing...\n");
     
     mutex_lock(&dev->dev_lock);
     
@@ -580,8 +585,8 @@ static __poll_t csi2_poll(struct file *file, struct poll_table_struct *wait)
     return vb2_poll(&dev->queue, file, wait);
 }
 
-// IRQ handler
-static irqreturn_t csi2_irq_handler(int irq, void *dev_id)
+// Legacy IRQ handler (MSI-X가 실패했을 때 사용)
+static irqreturn_t csi2_legacy_irq_handler(int irq, void *dev_id)
 {
     struct csi2_v4l2_device *dev = dev_id;
     u32 int_status;
@@ -593,15 +598,145 @@ static irqreturn_t csi2_irq_handler(int irq, void *dev_id)
     // Clear interrupt
     csi2_write_reg(dev, CSI2_REG_INT_STATUS, int_status);
     
-    // Handle frame received interrupt
+    // Handle frame interrupt
     if (int_status & 0x80000000) {
-        // Frame received from CSI2 controller
         if (dev->streaming) {
             queue_work(dev->frame_wq, &dev->frame_work);
         }
     }
     
+    // Handle error interrupts
+    if (int_status & 0x7FFFFFFF) {
+        dev_warn(&dev->pdev->dev, "CSI2 error interrupt: 0x%08x\n", int_status);
+    }
+    
     return IRQ_HANDLED;
+}
+
+// MSI-X interrupt handlers
+static irqreturn_t csi2_frame_irq_handler(int irq, void *dev_id)
+{
+    struct csi2_v4l2_device *dev = dev_id;
+    u32 int_status;
+    
+    int_status = csi2_read_reg(dev, CSI2_REG_INT_STATUS);
+    if (!(int_status & 0x80000000))
+        return IRQ_NONE;
+    
+    // Clear frame interrupt
+    csi2_write_reg(dev, CSI2_REG_INT_STATUS, 0x80000000);
+    
+    if (dev->streaming) {
+        queue_work(dev->frame_wq, &dev->frame_work);
+    }
+    
+    return IRQ_HANDLED;
+}
+
+static irqreturn_t csi2_error_irq_handler(int irq, void *dev_id)
+{
+    struct csi2_v4l2_device *dev = dev_id;
+    u32 int_status;
+    
+    int_status = csi2_read_reg(dev, CSI2_REG_INT_STATUS);
+    if (!(int_status & 0x7FFFFFFF))
+        return IRQ_NONE;
+    
+    // Clear error interrupts
+    csi2_write_reg(dev, CSI2_REG_INT_STATUS, int_status & 0x7FFFFFFF);
+    
+    dev_warn(&dev->pdev->dev, "CSI2 error interrupt: 0x%08x\n", int_status);
+    
+    return IRQ_HANDLED;
+}
+
+// MSI-X setup
+static int csi2_setup_msix(struct csi2_v4l2_device *dev)
+{
+    int ret, i;
+    
+    // Initialize MSI-X entries
+    for (i = 0; i < CSI2_MSIX_VECTORS; i++) {
+        dev->msix_entries[i].entry = i;
+    }
+    
+    // Enable MSI-X
+    ret = pci_enable_msix_exact(dev->pdev, dev->msix_entries, CSI2_MSIX_VECTORS);
+    if (ret) {
+        dev_warn(&dev->pdev->dev, "Failed to enable MSI-X: %d, will use legacy IRQ\n", ret);
+        return ret;
+    }
+    
+    dev_info(&dev->pdev->dev, "Allocated %d MSI-X vectors\n", CSI2_MSIX_VECTORS);
+    
+    // Request frame interrupt handler
+    ret = request_irq(dev->msix_entries[CSI2_MSIX_FRAME_VEC].vector,
+                     csi2_frame_irq_handler, 0, "csi2-frame", dev);
+    if (ret) {
+        dev_err(&dev->pdev->dev, "Failed to request frame IRQ: %d\n", ret);
+        goto err_disable_msix;
+    }
+    
+    dev_info(&dev->pdev->dev, "MSI-X frame handler registered (IRQ %d)\n",
+             dev->msix_entries[CSI2_MSIX_FRAME_VEC].vector);
+    
+    // Request error interrupt handler
+    ret = request_irq(dev->msix_entries[CSI2_MSIX_ERROR_VEC].vector,
+                     csi2_error_irq_handler, 0, "csi2-error", dev);
+    if (ret) {
+        dev_err(&dev->pdev->dev, "Failed to request error IRQ: %d\n", ret);
+        goto err_free_frame_irq;
+    }
+    
+    dev_info(&dev->pdev->dev, "MSI-X error handler registered (IRQ %d)\n",
+             dev->msix_entries[CSI2_MSIX_ERROR_VEC].vector);
+    
+    dev->msix_enabled = true;
+    dev->use_legacy_irq = false;
+    dev_info(&dev->pdev->dev, "MSI-X setup completed successfully\n");
+    
+    return 0;
+    
+err_free_frame_irq:
+    free_irq(dev->msix_entries[CSI2_MSIX_FRAME_VEC].vector, dev);
+err_disable_msix:
+    pci_disable_msix(dev->pdev);
+    return ret;
+}
+
+// Legacy IRQ setup
+static int csi2_setup_legacy_irq(struct csi2_v4l2_device *dev)
+{
+    int ret;
+    
+    ret = request_irq(dev->pdev->irq, csi2_legacy_irq_handler, 
+                     IRQF_SHARED, DRIVER_NAME, dev);
+    if (ret) {
+        dev_err(&dev->pdev->dev, "Failed to request legacy IRQ %d: %d\n", 
+                dev->pdev->irq, ret);
+        return ret;
+    }
+    
+    dev->use_legacy_irq = true;
+    dev->msix_enabled = false;
+    dev_info(&dev->pdev->dev, "Legacy IRQ %d registered\n", dev->pdev->irq);
+    
+    return 0;
+}
+
+static void csi2_cleanup_interrupts(struct csi2_v4l2_device *dev)
+{
+    if (dev->msix_enabled) {
+        free_irq(dev->msix_entries[CSI2_MSIX_ERROR_VEC].vector, dev);
+        free_irq(dev->msix_entries[CSI2_MSIX_FRAME_VEC].vector, dev);
+        pci_disable_msix(dev->pdev);
+        dev->msix_enabled = false;
+        dev_info(&dev->pdev->dev, "MSI-X cleaned up\n");
+    } else if (dev->use_legacy_irq) {
+        free_irq(dev->pdev->irq, dev);
+        dev->use_legacy_irq = false;
+        dev_info(&dev->pdev->dev, "Legacy IRQ cleaned up\n");
+    }
 }
 
 // PCI probe
@@ -610,7 +745,7 @@ static int csi2_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     struct csi2_v4l2_device *dev;
     int ret;
     
-    dev_info(&pdev->dev, "Probing QEMU CSI2 device\n");
+    dev_info(&pdev->dev, "Probing QEMU CSI2 device (fixed version)\n");
     
     // Allocate device structure
     dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
@@ -672,6 +807,8 @@ static int csi2_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         goto err_unmap;
     }
     
+    dev_info(&pdev->dev, "V4L2 device registered successfully\n");
+    
     // Initialize video buffer queue
     dev->queue.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     dev->queue.io_modes = VB2_MMAP | VB2_READ | VB2_USERPTR;
@@ -689,26 +826,22 @@ static int csi2_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         goto err_unreg_v4l2;
     }
     
-    // Initialize video device
-    dev->vdev = (struct video_device) {
-        .name = DEVICE_NAME,
-        .fops = &csi2_fops,
-        .ioctl_ops = &csi2_ioctl_ops,
-        .minor = -1,
-        .release = video_device_release_empty,
-        .lock = &dev->dev_lock,
-        .queue = &dev->queue,
-        .device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE | V4L2_CAP_STREAMING,
-    };
+    dev_info(&pdev->dev, "VB2 queue initialized successfully\n");
     
+    // Initialize video device (정적 할당)
+    strscpy(dev->vdev.name, DEVICE_NAME, sizeof(dev->vdev.name));
+    dev->vdev.fops = &csi2_fops;
+    dev->vdev.ioctl_ops = &csi2_ioctl_ops;
+    dev->vdev.minor = -1;
+    dev->vdev.release = video_device_release_empty;  // 정적 할당이므로 빈 함수 사용
+    dev->vdev.lock = &dev->dev_lock;
+    dev->vdev.queue = &dev->queue;
+    dev->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE | V4L2_CAP_STREAMING;
     dev->vdev.v4l2_dev = &dev->v4l2_dev;
+    
     video_set_drvdata(&dev->vdev, dev);
     
-    // Debug information
-    dev_info(&pdev->dev, "Video device name: %s\n", dev->vdev.name);
-    dev_info(&pdev->dev, "Video device fops: %p\n", dev->vdev.fops);
-    dev_info(&pdev->dev, "Video device ioctl_ops: %p\n", dev->vdev.ioctl_ops);
-    dev_info(&pdev->dev, "Video device v4l2_dev: %p\n", dev->vdev.v4l2_dev);
+    dev_info(&pdev->dev, "Video device structure initialized\n");
     
     // Register video device
     ret = video_register_device(&dev->vdev, VFL_TYPE_VIDEO, -1);
@@ -716,6 +849,10 @@ static int csi2_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         dev_err(&pdev->dev, "Failed to register video device: %d\n", ret);
         goto err_unreg_v4l2;
     }
+    
+    dev->v4l2_registered = true;
+    dev_info(&pdev->dev, "Video device registered as %s\n", 
+             video_device_node_name(&dev->vdev));
     
     // Create workqueue for frame processing
     dev->frame_wq = create_singlethread_workqueue("csi2_frames");
@@ -730,17 +867,13 @@ static int csi2_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     // Initialize timer
     timer_setup(&dev->frame_timer, csi2_frame_timer_callback, 0);
     
-    // Request IRQ
-    dev->irq = pdev->irq;
-    if (dev->irq > 0) {
-        ret = request_irq(dev->irq, csi2_irq_handler, IRQF_SHARED, 
-                         DRIVER_NAME, dev);
+    // Setup interrupts (MSI-X 우선, 실패시 legacy IRQ)
+    if (csi2_setup_msix(dev) != 0) {
+        dev_info(&pdev->dev, "MSI-X setup failed, trying legacy IRQ\n");
+        ret = csi2_setup_legacy_irq(dev);
         if (ret) {
-            dev_warn(&pdev->dev, "Failed to request IRQ %d: %d\n", 
-                    dev->irq, ret);
-            dev->irq = 0;
-        } else {
-            dev_info(&pdev->dev, "IRQ %d registered\n", dev->irq);
+            dev_err(&pdev->dev, "Both MSI-X and legacy IRQ setup failed\n");
+            goto err_cleanup_workqueue;
         }
     }
     
@@ -750,13 +883,26 @@ static int csi2_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     
     dev->initialized = true;
     
-    dev_info(&pdev->dev, "QEMU CSI2 V4L2 device registered as %s\n", 
-             video_device_node_name(&dev->vdev));
+    dev_info(&pdev->dev, "QEMU CSI2 V4L2 device registered successfully\n");
+    if (dev->msix_enabled) {
+        dev_info(&pdev->dev, "Interrupt mode: MSI-X (vectors: Frame=%d, Error=%d)\n",
+                 dev->msix_entries[CSI2_MSIX_FRAME_VEC].vector,
+                 dev->msix_entries[CSI2_MSIX_ERROR_VEC].vector);
+    } else {
+        dev_info(&pdev->dev, "Interrupt mode: Legacy IRQ %d\n", dev->pdev->irq);
+    }
     
     return 0;
 
+err_cleanup_workqueue:
+    if (dev->frame_wq) {
+        destroy_workqueue(dev->frame_wq);
+    }
 err_unreg_video:
-    video_unregister_device(&dev->vdev);
+    if (dev->v4l2_registered) {
+        video_unregister_device(&dev->vdev);
+        dev->v4l2_registered = false;
+    }
 err_unreg_v4l2:
     v4l2_device_unregister(&dev->v4l2_dev);
 err_unmap:
@@ -785,7 +931,7 @@ static void csi2_pci_remove(struct pci_dev *pdev)
     }
     
     // Stop and cleanup timer
-    timer_delete_sync(&dev->frame_timer);  // Linux 6.15+ 호환
+    timer_delete_sync(&dev->frame_timer);
     
     // Cleanup workqueue
     if (dev->frame_wq) {
@@ -793,13 +939,15 @@ static void csi2_pci_remove(struct pci_dev *pdev)
         destroy_workqueue(dev->frame_wq);
     }
     
-    // Free IRQ
-    if (dev->irq > 0) {
-        free_irq(dev->irq, dev);
-    }
+    // Cleanup interrupts
+    csi2_cleanup_interrupts(dev);
     
     // Unregister devices
-    video_unregister_device(&dev->vdev);
+    if (dev->v4l2_registered) {
+        video_unregister_device(&dev->vdev);
+        dev->v4l2_registered = false;
+    }
+    
     v4l2_device_unregister(&dev->v4l2_dev);
     
     // Cleanup PCI
@@ -830,7 +978,7 @@ static int __init csi2_init(void)
 {
     int ret;
     
-    pr_info("QEMU CSI2 V4L2 Driver loading...\n");
+    pr_info("QEMU CSI2 V4L2 Driver (Fixed Version) loading...\n");
     
     ret = pci_register_driver(&csi2_pci_driver);
     if (ret) {
@@ -853,6 +1001,6 @@ module_init(csi2_init);
 module_exit(csi2_exit);
 
 MODULE_AUTHOR("QEMU CSI2 Team");
-MODULE_DESCRIPTION("QEMU CSI2 V4L2 Integration Driver");
+MODULE_DESCRIPTION("QEMU CSI2 V4L2 Integration Driver (Fixed)");
 MODULE_LICENSE("GPL v2");
-MODULE_VERSION("1.0");
+MODULE_VERSION("1.2");
