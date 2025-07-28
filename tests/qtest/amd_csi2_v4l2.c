@@ -29,6 +29,7 @@
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-fh.h>
 #include <media/v4l2-event.h>
+#include <media/v4l2-ctrls.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-dma-contig.h>
 
@@ -38,6 +39,28 @@
 /* PCI Device IDs */
 #define AMD_VENDOR_ID 0x1022
 #define AMD_CSI2_DEVICE_ID 0xC901
+
+/* Missing defines for older kernels */
+#ifndef PCI_IRQ_NOLEGACY
+#define PCI_IRQ_NOLEGACY	0x00000004  /* Exclude legacy interrupt */
+#endif
+
+/* Compatibility functions for different kernel versions */
+static inline bool pci_device_is_busmaster(struct pci_dev *pdev)
+{
+    u16 cmd;
+    pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+    return !!(cmd & PCI_COMMAND_MASTER);
+}
+
+static inline bool pci_device_msix_enabled(struct pci_dev *pdev)
+{
+    u16 control;
+    if (!pdev->msix_cap)
+        return false;
+    pci_read_config_word(pdev, pdev->msix_cap + PCI_MSIX_FLAGS, &control);
+    return !!(control & PCI_MSIX_FLAGS_ENABLE);
+}
 
 /* Register Definitions */
 #define CSI2_REG_CORE_CONFIG           0x00
@@ -134,10 +157,11 @@ struct amd_csi2_dev {
     struct pci_dev *pdev;
     struct v4l2_device v4l2_dev;
     struct video_device vdev;
-    struct v4l2_ctrl_handler ctrl_handler;
+    /* Remove ctrl_handler for now to avoid incomplete type issues */
     
     /* Hardware resources */
     void __iomem *mmio_base;
+    void __iomem *msix_base;  /* MSI-X vector table mapping */
     int irq;
     bool msix_enabled;
     
@@ -174,6 +198,7 @@ struct amd_csi2_dev {
 static int amd_csi2_setup_msix(struct amd_csi2_dev *csi2_dev)
 {
     struct pci_dev *pdev = csi2_dev->pdev;
+    void __iomem *msix_base;
     int ret, nvec, i;
     
     dev_info(&pdev->dev, "🔧 Setting up MSI-X interrupts (v2.0)\n");
@@ -206,7 +231,7 @@ static int amd_csi2_setup_msix(struct amd_csi2_dev *csi2_dev)
     }
     
     /* Ensure bus mastering is enabled */
-    if (!pci_is_busmaster(pdev)) {
+    if (!pci_device_is_busmaster(pdev)) {
         dev_info(&pdev->dev, "🚌 Enabling bus master\n");
         pci_set_master(pdev);
     }
@@ -233,13 +258,115 @@ static int amd_csi2_setup_msix(struct amd_csi2_dev *csi2_dev)
     dev_info(&pdev->dev, "✅ Successfully allocated %d MSI-X vectors\n", ret);
     
     /* Verify MSI-X is actually enabled */
-    if (!pci_msix_enabled(pdev)) {
+    if (!pci_device_msix_enabled(pdev)) {
         dev_err(&pdev->dev, "❌ MSI-X not enabled after allocation!\n");
         pci_free_irq_vectors(pdev);
         return -ENODEV;
     }
     
     dev_info(&pdev->dev, "✅ MSI-X is now enabled in hardware\n");
+    
+    /* Check and clear MSI-X global mask bit */
+    int msix_cap = pci_find_capability(pdev, PCI_CAP_ID_MSIX);
+    if (msix_cap) {
+        u16 control;
+        pci_read_config_word(pdev, msix_cap + PCI_MSIX_FLAGS, &control);
+        dev_info(&pdev->dev, "📊 MSI-X control register: 0x%04x\n", control);
+        
+        /* Check if function mask bit is set (bit 14 = 0x4000) - use hardcoded value */
+        #define MSIX_FUNCTION_MASK 0x4000
+        if (control & MSIX_FUNCTION_MASK) {
+            dev_warn(&pdev->dev, "⚠️  MSI-X globally masked (bit 14)! Clearing function mask...\n");
+            control &= ~MSIX_FUNCTION_MASK;
+            pci_write_config_word(pdev, msix_cap + PCI_MSIX_FLAGS, control);
+            
+            /* Re-read to verify */
+            pci_read_config_word(pdev, msix_cap + PCI_MSIX_FLAGS, &control);
+            dev_info(&pdev->dev, "📊 MSI-X control after unmask: 0x%04x\n", control);
+            
+            if (control & MSIX_FUNCTION_MASK) {
+                dev_err(&pdev->dev, "❌ Failed to clear MSI-X function mask!\n");
+            } else {
+                dev_info(&pdev->dev, "✅ MSI-X function mask cleared successfully!\n");
+            }
+        } else {
+            dev_info(&pdev->dev, "ℹ️  MSI-X function mask already clear (0x%04x)\n", control);
+        }
+        
+        /* Force clear the mask bit even if it wasn't detected */
+        dev_info(&pdev->dev, "🔧 Force clearing MSI-X function mask bit (0x4000)...\n");
+        u16 old_control = control;
+        control = (control & ~MSIX_FUNCTION_MASK) | PCI_MSIX_FLAGS_ENABLE;
+        pci_write_config_word(pdev, msix_cap + PCI_MSIX_FLAGS, control);
+        
+        /* Final verification */
+        pci_read_config_word(pdev, msix_cap + PCI_MSIX_FLAGS, &control);
+        dev_info(&pdev->dev, "🏁 MSI-X control: 0x%04x -> 0x%04x %s\n", 
+                 old_control, control,
+                 (control & MSIX_FUNCTION_MASK) ? "❌ STILL MASKED!" : "✅ UNMASKED!");
+    } else {
+        dev_err(&pdev->dev, "❌ MSI-X capability not found for global unmask!\n");
+    }
+    
+    /* Map MSI-X vector table (BAR 2) for verification */
+    msix_base = pci_ioremap_bar(pdev, 2);
+    if (!msix_base) {
+        dev_err(&pdev->dev, "❌ Failed to map MSI-X vector table - this is critical!\n");
+        pci_free_irq_vectors(pdev);
+        return -ENOMEM;
+    } else {
+        dev_info(&pdev->dev, "📍 MSI-X vector table mapped at %p\n", msix_base);
+        
+        /* Read and display MSI-X vector table entries */
+        for (i = 0; i < min(ret, 4); i++) {
+            u32 addr_low = readl(msix_base + (i * 16) + 0);
+            u32 addr_high = readl(msix_base + (i * 16) + 4);
+            u32 msg_data = readl(msix_base + (i * 16) + 8);
+            u32 ctrl = readl(msix_base + (i * 16) + 12);
+            
+            dev_info(&pdev->dev, "📋 Vector %d: addr=0x%x%08x, data=0x%x, ctrl=0x%x\n",
+                     i, addr_high, addr_low, msg_data, ctrl);
+            
+            /* Force unmask ALL vectors regardless of current state */
+            dev_info(&pdev->dev, "🔓 BEFORE unmask - Vector %d ctrl=0x%x\n", i, ctrl);
+            writel(0, msix_base + (i * 16) + 12);
+            
+            /* Read back immediately */
+            ctrl = readl(msix_base + (i * 16) + 12);
+            dev_info(&pdev->dev, "🔓 AFTER unmask - Vector %d ctrl=0x%x\n", i, ctrl);
+            
+            /* If still masked, try harder */
+            if (ctrl & 1) {
+                dev_err(&pdev->dev, "❌ Vector %d still masked! Trying harder...\n", i);
+                int retry;
+                for (retry = 0; retry < 10; retry++) {
+                    writel(0x00000000, msix_base + (i * 16) + 12);
+                    wmb(); /* Write memory barrier */
+                    msleep(1);
+                    ctrl = readl(msix_base + (i * 16) + 12);
+                    dev_info(&pdev->dev, "🔄 Retry %d: Vector %d ctrl=0x%x\n", retry, i, ctrl);
+                    if (!(ctrl & 1)) {
+                        dev_info(&pdev->dev, "✅ Vector %d unmasked after %d retries!\n", i, retry + 1);
+                        break;
+                    }
+                }
+                if (ctrl & 1) {
+                    dev_err(&pdev->dev, "💥 CRITICAL: Vector %d cannot be unmasked! Hardware issue?\n", i);
+                }
+            } else {
+                dev_info(&pdev->dev, "✅ Vector %d successfully unmasked (ctrl=0x%x)\n", i, ctrl);
+            }
+            
+            /* Final verification */
+            ctrl = readl(msix_base + (i * 16) + 12);
+            dev_info(&pdev->dev, "🏁 FINAL - Vector %d ctrl=0x%x %s\n", 
+                     i, ctrl, (ctrl & 1) ? "❌ MASKED" : "✅ UNMASKED");
+        }
+        
+        /* Keep the mapping for potential later use - don't unmap yet */
+        /* We'll unmap it in the cleanup function */
+        csi2_dev->msix_base = msix_base;
+    }
     
     /* Get IRQ numbers for each vector */
     for (i = 0; i < ret; i++) {
@@ -270,6 +397,13 @@ static void amd_csi2_free_msix(struct amd_csi2_dev *csi2_dev)
 {
     if (csi2_dev->msix_enabled) {
         dev_info(&csi2_dev->pdev->dev, "🧹 Freeing MSI-X vectors\n");
+        
+        /* Unmap MSI-X table if it was mapped */
+        if (csi2_dev->msix_base) {
+            iounmap(csi2_dev->msix_base);
+            csi2_dev->msix_base = NULL;
+        }
+        
         pci_free_irq_vectors(csi2_dev->pdev);
         csi2_dev->msix_enabled = false;
         csi2_dev->irq = 0;
@@ -280,25 +414,47 @@ static void amd_csi2_free_msix(struct amd_csi2_dev *csi2_dev)
 static irqreturn_t amd_csi2_interrupt(int irq, void *dev_id)
 {
     struct amd_csi2_dev *csi2_dev = dev_id;
-    u32 isr_status;
+    u32 isr_status, global_enable, ier_status;
     unsigned long flags;
     bool handled = false;
     
     /* Increment interrupt counters */
     csi2_dev->total_interrupts++;
     
-    /* First interrupt is special */
-    if (csi2_dev->total_interrupts == 1) {
-        dev_info(&csi2_dev->pdev->dev, "🎉 FIRST MSI-X INTERRUPT RECEIVED! IRQ=%d\n", irq);
+    /* Always log the first few interrupts */
+    if (csi2_dev->total_interrupts <= 5) {
+        dev_info(&csi2_dev->pdev->dev, "🎉 MSI-X INTERRUPT #%llu RECEIVED! IRQ=%d\n", 
+                 csi2_dev->total_interrupts, irq);
+                 
+        /* Check MSI-X vector table on first interrupt */
+        if (csi2_dev->total_interrupts == 1 && csi2_dev->msix_base) {
+            u32 addr_low = readl(csi2_dev->msix_base + 0);
+            u32 addr_high = readl(csi2_dev->msix_base + 4);
+            u32 msg_data = readl(csi2_dev->msix_base + 8);
+            u32 ctrl = readl(csi2_dev->msix_base + 12);
+            
+            dev_info(&csi2_dev->pdev->dev, 
+                     "🔍 MSI-X Vector 0 on first interrupt: addr=0x%x%08x, data=0x%x, ctrl=0x%x\n",
+                     addr_high, addr_low, msg_data, ctrl);
+        }
     }
     
-    /* Read interrupt status */
+    /* Read all relevant registers for debugging */
     isr_status = readl(csi2_dev->mmio_base + CSI2_REG_ISR);
+    global_enable = readl(csi2_dev->mmio_base + CSI2_REG_GLOBAL_INT_ENABLE);
+    ier_status = readl(csi2_dev->mmio_base + CSI2_REG_IER);
     
-    dev_dbg(&csi2_dev->pdev->dev, "🔔 Interrupt: IRQ=%d, ISR=0x%08x\n", irq, isr_status);
+    /* Log detailed interrupt information */
+    if (csi2_dev->total_interrupts <= 10 || (csi2_dev->total_interrupts % 100 == 0)) {
+        dev_info(&csi2_dev->pdev->dev, 
+                 "🔔 IRQ %d: ISR=0x%08x, Global=0x%08x, IER=0x%08x\n", 
+                 irq, isr_status, global_enable, ier_status);
+    }
     
     if (!isr_status) {
-        dev_dbg(&csi2_dev->pdev->dev, "⚠️  Spurious interrupt (ISR=0)\n");
+        if (csi2_dev->total_interrupts <= 5) {
+            dev_warn(&csi2_dev->pdev->dev, "⚠️  Spurious interrupt (ISR=0)\n");
+        }
         return IRQ_NONE;
     }
     
@@ -307,7 +463,7 @@ static irqreturn_t amd_csi2_interrupt(int irq, void *dev_id)
     /* Handle frame received interrupt */
     if (isr_status & ISR_FRAME_RECEIVED) {
         csi2_dev->frame_interrupts++;
-        dev_dbg(&csi2_dev->pdev->dev, "🎬 Frame received interrupt (#%llu)\n", 
+        dev_info(&csi2_dev->pdev->dev, "🎬 Frame received interrupt (#%llu)\n", 
                 csi2_dev->frame_interrupts);
         
         /* Signal capture thread */
@@ -324,16 +480,27 @@ static irqreturn_t amd_csi2_interrupt(int irq, void *dev_id)
         handled = true;
     }
     
+    /* Handle any other interrupts */
+    if (isr_status & ~(ISR_FRAME_RECEIVED | ISR_CRC_ERROR | ISR_ECC_1BIT_ERROR | 
+                       ISR_ECC_2BIT_ERROR | ISR_SOT_ERROR | ISR_SOT_SYNC_ERROR | 
+                       ISR_STREAM_LINE_BUFFER_FULL)) {
+        dev_info(&csi2_dev->pdev->dev, "🔔 Other interrupt bits: 0x%08lx\n", 
+                 (unsigned long)(isr_status & ~(ISR_FRAME_RECEIVED | ISR_CRC_ERROR | ISR_ECC_1BIT_ERROR | 
+                               ISR_ECC_2BIT_ERROR | ISR_SOT_ERROR | ISR_SOT_SYNC_ERROR | 
+                               ISR_STREAM_LINE_BUFFER_FULL)));
+        handled = true;
+    }
+    
     /* Clear interrupt status */
     writel(isr_status, csi2_dev->mmio_base + CSI2_REG_ISR);
     
-    spin_unlock_irqrestore(&csi2_dev->lock, flags);
-    
-    /* Log periodic statistics */
-    if (csi2_dev->total_interrupts % 100 == 0) {
-        dev_info(&csi2_dev->pdev->dev, "📊 Interrupt stats: %llu total (%llu frame, %llu error)\n",
-                 csi2_dev->total_interrupts, csi2_dev->frame_interrupts, csi2_dev->error_interrupts);
+    /* Verify interrupt was cleared */
+    if (csi2_dev->total_interrupts <= 5) {
+        u32 new_isr = readl(csi2_dev->mmio_base + CSI2_REG_ISR);
+        dev_info(&csi2_dev->pdev->dev, "🧹 ISR after clear: 0x%08x\n", new_isr);
     }
+    
+    spin_unlock_irqrestore(&csi2_dev->lock, flags);
     
     return handled ? IRQ_HANDLED : IRQ_NONE;
 }
@@ -398,12 +565,20 @@ static int amd_csi2_hw_init(struct amd_csi2_dev *csi2_dev)
     
     dev_info(&csi2_dev->pdev->dev, "🔧 Initializing CSI-2 hardware\n");
     
+    /* Read initial register values for debugging */
+    val = readl(csi2_dev->mmio_base + CSI2_REG_CORE_CONFIG);
+    dev_info(&csi2_dev->pdev->dev, "Initial CORE_CONFIG: 0x%08x\n", val);
+    
     /* Soft reset */
     writel(CONTROL_SOFT_RESET, csi2_dev->mmio_base + CSI2_REG_CORE_CONFIG);
     msleep(10);
     
     /* Enable core */
     writel(CONTROL_CORE_ENABLE, csi2_dev->mmio_base + CSI2_REG_CORE_CONFIG);
+    
+    /* Verify core is enabled */
+    val = readl(csi2_dev->mmio_base + CSI2_REG_CORE_CONFIG);
+    dev_info(&csi2_dev->pdev->dev, "CORE_CONFIG after enable: 0x%08x\n", val);
     
     /* Configure protocol (4 lanes) */
     writel(0x3, csi2_dev->mmio_base + CSI2_REG_PROTOCOL_CONFIG);
@@ -422,13 +597,29 @@ static int amd_csi2_hw_init(struct amd_csi2_dev *csi2_dev)
     
     /* Clear any pending interrupts */
     val = readl(csi2_dev->mmio_base + CSI2_REG_ISR);
+    dev_info(&csi2_dev->pdev->dev, "Clearing ISR: 0x%08x\n", val);
     writel(val, csi2_dev->mmio_base + CSI2_REG_ISR);
     
     /* Enable frame received interrupt */
     writel(ISR_FRAME_RECEIVED, csi2_dev->mmio_base + CSI2_REG_IER);
+    val = readl(csi2_dev->mmio_base + CSI2_REG_IER);
+    dev_info(&csi2_dev->pdev->dev, "IER set to: 0x%08x\n", val);
     
     /* Enable global interrupts */
     writel(0x1, csi2_dev->mmio_base + CSI2_REG_GLOBAL_INT_ENABLE);
+    val = readl(csi2_dev->mmio_base + CSI2_REG_GLOBAL_INT_ENABLE);
+    dev_info(&csi2_dev->pdev->dev, "Global interrupt enable: 0x%08x\n", val);
+    
+    /* Test interrupt generation - write to a test register */
+    dev_info(&csi2_dev->pdev->dev, "🧪 Testing interrupt generation...\n");
+    
+    /* Simulate frame received by writing directly to ISR (if supported by QEMU device) */
+    writel(ISR_FRAME_RECEIVED, csi2_dev->mmio_base + CSI2_REG_ISR);
+    
+    /* Check if interrupt was generated */
+    msleep(100);
+    val = readl(csi2_dev->mmio_base + CSI2_REG_ISR);
+    dev_info(&csi2_dev->pdev->dev, "ISR after test write: 0x%08x\n", val);
     
     dev_info(&csi2_dev->pdev->dev, "✅ CSI-2 hardware initialized\n");
     
