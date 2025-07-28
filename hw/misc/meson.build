@@ -164,19 +164,20 @@ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
 
 # MIPI CSI-2 support
 system_ss.add(when: 'CONFIG_MIPI_CSI2', if_true: files(
-  'csi2_rx_controller.c',
+  #'csi2_rx_controller.c',
   #'csi2_dphy.c',
-  'csi2_v4l2_bridge.c',
+  #'csi2_v4l2_bridge.c',
   #'csi2_subsystem.c',
-  'csi2_pcie_device.c',
+  #'csi2_pcie_device.c',
   #'csi2_v4l2_integration.c',
   #'csi2_unified.c',
   #'csi2_v4l2_simplified.c',
-  'v4l2_backend.c',
+  #'v4l2_backend.c',
   #'csi2_frontend.c',
-  #'csi2_msix_common.c'
+  #'csi2_msix_common.c',
+  'amd_csi2_pcie_sink.c'
 ))
 
 # MIPI CSI-2 V4L2 Loopback support - New implementation
-system_ss.add(files('csi2_v4l2_loopback_pcie.c'))
+#system_ss.add(files('csi2_v4l2_loopback_pcie.c'))
 
