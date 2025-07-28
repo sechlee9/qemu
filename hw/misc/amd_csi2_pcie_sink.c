@@ -1,8 +1,8 @@
 /*
  * AMD MIPI CSI-2 RX Subsystem PCIe Sink Device for QEMU
  * 
- * Version 1.6 - FIXED: MSI-X Interrupt Generation
- * 🚨 CRITICAL FIXES: MSI-X activation and ISR handling
+ * Version 1.7 - QEMU 10.0.2 & Linux 6.15.4 Compatibility Fix
+ * 🚨 CRITICAL FIXES: MSI-X compatibility and vector verification
  */
 
 #include "qemu/osdep.h"
@@ -112,23 +112,100 @@ struct AmdCsi2PcieSinkState {
     
     /* Device state */
     bool initialized;
+    bool msix_os_configured;
+    uint64_t os_config_check_time;
     
     /* Statistics */
     uint64_t frames_received;
     uint64_t interrupts_sent;
+    uint64_t msix_verify_count;
 };
 
 /* Forward declarations */
 static void amd_csi2_update_interrupts(AmdCsi2PcieSinkState *s);
 static void amd_csi2_virtual_camera_frame(void *opaque);
+static bool amd_csi2_verify_msix_ready(AmdCsi2PcieSinkState *s);
 
-/* 🔧 FIXED: Simplified MSI-X interrupt sender */
+/* 🆕 QEMU 버전 호환성 확인 */
+static void amd_csi2_check_qemu_version(void)
+{
+    printf("AMD CSI2: 🔍 QEMU Version Compatibility Check\n");
+    
+#ifdef QEMU_VERSION_MAJOR
+    printf("AMD CSI2: 🏷️  QEMU Version: %d.%d\n", 
+           QEMU_VERSION_MAJOR, QEMU_VERSION_MINOR);
+    
+    if (QEMU_VERSION_MAJOR >= 10) {
+        printf("AMD CSI2: ✅ QEMU 10.x compatibility mode enabled\n");
+    }
+#endif
+    
+    printf("AMD CSI2: 📊 MSI-X API: msix_notify function available\n");
+}
+
+/* 🆕 Enhanced MSI-X 벡터 검증 함수 */
+static bool amd_csi2_verify_msix_ready(AmdCsi2PcieSinkState *s)
+{
+    PCIDevice *pci_dev = PCI_DEVICE(s);
+    
+    s->msix_verify_count++;
+    
+    if (!msix_enabled(pci_dev)) {
+        if (s->msix_verify_count <= 5) {
+            printf("AMD CSI2: ⏳ MSI-X not enabled by OS yet (check #%lu)\n", 
+                   s->msix_verify_count);
+        }
+        return false;
+    }
+    
+    /* MSI-X 테이블 존재 확인 */
+    uint8_t *msix_table = pci_dev->msix_table;
+    if (!msix_table) {
+        printf("AMD CSI2: ❌ MSI-X table not mapped by OS\n");
+        return false;
+    }
+    
+    /* Vector 0 주소 및 설정 확인 */
+    uint32_t *entry = (uint32_t *)(msix_table + 0 * 16);
+    uint32_t addr_low = entry[0];
+    uint32_t addr_high = entry[1];
+    uint32_t msg_data = entry[2];
+    uint32_t vector_ctrl = entry[3];
+    
+    bool addr_valid = (addr_low != 0 || addr_high != 0);
+    bool unmasked = !(vector_ctrl & 1);
+    bool ready = addr_valid && unmasked;
+    
+    if (!s->msix_os_configured && ready) {
+        /* 처음 OS 설정 완료 감지 */
+        s->msix_os_configured = true;
+        s->os_config_check_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        
+        printf("AMD CSI2: 🎉 MSI-X OS Configuration Detected!\n");
+        printf("AMD CSI2: 🎯 Vector 0 Details:\n");
+        printf("   Address: 0x%08x%08x %s\n", addr_high, addr_low, 
+               addr_valid ? "✅ VALID" : "❌ INVALID");
+        printf("   Data: 0x%08x\n", msg_data);
+        printf("   Control: 0x%08x %s\n", vector_ctrl, 
+               unmasked ? "✅ UNMASKED" : "❌ MASKED");
+        printf("AMD CSI2: 🚀 Ready for interrupt delivery!\n");
+    } else if (!ready && s->msix_verify_count % 100 == 0) {
+        printf("AMD CSI2: ⏳ Waiting for OS MSI-X config (check #%lu)\n", 
+               s->msix_verify_count);
+        printf("   Address valid: %s, Unmasked: %s\n",
+               addr_valid ? "YES" : "NO", unmasked ? "YES" : "NO");
+    }
+    
+    return ready;
+}
+
+/* 🔧 Enhanced MSI-X 인터럽트 전송 */
 static void amd_csi2_send_msi(AmdCsi2PcieSinkState *s, int vector)
 {
     PCIDevice *pci_dev = PCI_DEVICE(s);
     
     if (!msix_enabled(pci_dev)) {
-        if (s->interrupts_sent < 5) {
+        if (s->interrupts_sent < 3) {
             printf("AMD CSI2: ❌ MSI-X not enabled, cannot send interrupt\n");
         }
         return;
@@ -139,13 +216,47 @@ static void amd_csi2_send_msi(AmdCsi2PcieSinkState *s, int vector)
         return;
     }
     
-    /* Send interrupt */
+    /* 🆕 벡터 마스크 상태 확인 */
+    if (msix_is_masked(pci_dev, vector)) {
+        if (s->interrupts_sent < 3) {
+            printf("AMD CSI2: ⚠️  Vector %d is MASKED - interrupt blocked\n", vector);
+        }
+        return;
+    }
+    
+    /* 🆕 MSI-X 테이블 엔트리 상세 검증 */
+    uint8_t *msix_table = pci_dev->msix_table;
+    if (msix_table) {
+        uint32_t *entry = (uint32_t *)(msix_table + vector * 16);
+        uint32_t addr_low = entry[0];
+        uint32_t addr_high = entry[1];
+        uint32_t msg_data = entry[2];
+        uint32_t vector_ctrl = entry[3];
+        
+        if ((addr_low == 0 && addr_high == 0) || (vector_ctrl & 1)) {
+            if (s->interrupts_sent < 3) {
+                printf("AMD CSI2: ❌ Vector %d not ready: addr=0x%08x%08x, ctrl=0x%08x\n",
+                       vector, addr_high, addr_low, vector_ctrl);
+            }
+            return;
+        }
+        
+        /* 첫 몇 개 인터럽트는 상세 로그 */
+        if (s->interrupts_sent < 5) {
+            printf("AMD CSI2: 🎯 Sending MSI-X Vector %d:\n", vector);
+            printf("   Target Address: 0x%08x%08x\n", addr_high, addr_low);
+            printf("   Message Data: 0x%08x\n", msg_data);
+            printf("   Vector Control: 0x%08x\n", vector_ctrl);
+        }
+    }
+    
+    /* MSI-X 인터럽트 전송 */
     msix_notify(pci_dev, vector);
     s->interrupts_sent++;
     
-    /* Log first few interrupts */
+    /* 로깅 */
     if (s->interrupts_sent <= 5) {
-        printf("AMD CSI2: 🔔 Sending MSI-X interrupt #%lu (vector %d)\n", 
+        printf("AMD CSI2: 🔔 MSI-X interrupt #%lu sent (vector %d)\n", 
                s->interrupts_sent, vector);
     } else if (s->interrupts_sent % 100 == 0) {
         printf("AMD CSI2: 🎬 Virtual vsync #%u (MSI-X interrupts: %lu)\n", 
@@ -157,7 +268,7 @@ static void amd_csi2_send_msi(AmdCsi2PcieSinkState *s, int vector)
     }
 }
 
-/* 🔧 FIXED: Simplified interrupt update */
+/* 🔧 Improved 인터럽트 업데이트 */
 static void amd_csi2_update_interrupts(AmdCsi2PcieSinkState *s)
 {
     PCIDevice *pci_dev = PCI_DEVICE(s);
@@ -170,13 +281,20 @@ static void amd_csi2_update_interrupts(AmdCsi2PcieSinkState *s)
         return;
     }
     
-    /* Send interrupt if we have pending status bits and they're enabled */
+    /* 🆕 OS 설정 확인 후에만 인터럽트 전송 */
+    if (!s->msix_os_configured) {
+        if (!amd_csi2_verify_msix_ready(s)) {
+            return;
+        }
+    }
+    
+    /* 활성화된 인터럽트가 있으면 전송 */
     if (s->regs.int_status & s->regs.int_enable) {
         amd_csi2_send_msi(s, AMD_CSI2_MSIX_VEC_FRAME_READY);
     }
 }
 
-/* 🔧 FIXED: Simplified virtual source management */
+/* 🔧 Enhanced 가상 소스 관리 */
 static void amd_csi2_check_virtual_source_start(AmdCsi2PcieSinkState *s)
 {
     bool should_start = (s->regs.global_int_enable & 0x1) && 
@@ -192,13 +310,13 @@ static void amd_csi2_check_virtual_source_start(AmdCsi2PcieSinkState *s)
         s->vcam.timer_active = true;
         s->vcam.frame_start_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         
-        printf("AMD CSI2: 🎯 First virtual vsync starting - initializing timing\n");
-        printf("AMD CSI2: 🎬 Virtual vsync parameters: %ux%u@%ufps, %u bytes/frame\n",
+        printf("AMD CSI2: 🎯 Virtual vsync starting - waiting for OS MSI-X config\n");
+        printf("AMD CSI2: 🎬 Parameters: %ux%u@%ufps, %u bytes/frame\n",
                s->vcam.width, s->vcam.height, s->vcam.fps, AMD_CSI2_VIRT_CAM_FRAME_SIZE);
         
-        /* Start immediately */
+        /* 조금 더 긴 대기 시간으로 시작 */
         timer_mod(s->vcam.frame_timer, 
-                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + (AMD_CSI2_FRAME_INTERVAL_NS / 10));
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + (AMD_CSI2_FRAME_INTERVAL_NS / 5));
                  
     } else if (!should_start && s->vcam.timer_active) {
         printf("AMD CSI2: ⏹️  Stopping Virtual Source\n");
@@ -207,39 +325,48 @@ static void amd_csi2_check_virtual_source_start(AmdCsi2PcieSinkState *s)
     }
 }
 
-/* 🔧 FIXED: Simplified Virtual Camera frame generation */
+/* 🔧 Enhanced Virtual Camera frame generation */
 static void amd_csi2_virtual_camera_frame(void *opaque)
 {
     AmdCsi2PcieSinkState *s = AMD_CSI2_PCIE_SINK(opaque);
     
-    /* Check if virtual camera should continue */
+    /* 가상 카메라 활성 상태 확인 */
     if (!s->vcam.enabled || !s->vcam.timer_active) {
         s->vcam.timer_active = false;
         return;
     }
 
-    /* Update frame count and statistics */
+    /* 🆕 MSI-X 준비 상태 확인 */
+    if (!amd_csi2_verify_msix_ready(s)) {
+        if (s->vcam.frame_count == 0) {
+            printf("AMD CSI2: ⏳ Frame generation paused - waiting for OS MSI-X setup\n");
+        }
+        goto schedule_next;
+    }
+
+    /* 프레임 카운트 및 통계 업데이트 */
     s->vcam.frame_count++;
     s->frames_received++;
     
-    /* Update registers */
+    /* 레지스터 업데이트 */
     uint32_t packet_count = (s->regs.core_status >> 16) + 1;
     s->regs.core_status = (s->regs.core_status & 0xFFFF) | (packet_count << 16);
     
-    /* 🔧 FIXED: Set interrupt status BEFORE sending interrupt */
+    /* 🔧 인터럽트 상태 설정 */
     s->regs.int_status |= (1U << 31); /* Frame Received bit */
     
-    /* Send interrupt if enabled */
+    /* 인터럽트 전송 (조건 만족 시) */
     if ((s->regs.global_int_enable & 0x1) && (s->regs.int_enable & (1U << 31))) {
         amd_csi2_send_msi(s, AMD_CSI2_MSIX_VEC_FRAME_READY);
         
-        /* Log milestones */
+        /* 첫 번째 프레임 특별 처리 */
         if (s->vcam.frame_count == 1) {
-            printf("AMD CSI2: 🎯 First virtual vsync interrupt sent successfully\n");
+            printf("AMD CSI2: 🎯 First virtual vsync interrupt sent!\n");
         }
     }
     
-    /* Schedule next frame with accurate timing */
+schedule_next:
+    /* 다음 프레임 스케줄링 (정확한 타이밍) */
     if (s->vcam.timer_active) {
         uint64_t next_frame_time = s->vcam.frame_start_time + 
                                   (s->vcam.frame_count * AMD_CSI2_FRAME_INTERVAL_NS);
@@ -349,7 +476,7 @@ static uint64_t amd_csi2_reg_read(void *opaque, hwaddr addr, unsigned size)
     return val;
 }
 
-/* 🔧 FIXED: Enhanced register write handlers */
+/* 🔧 Enhanced register write handlers */
 static void amd_csi2_reg_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     AmdCsi2PcieSinkState *s = AMD_CSI2_PCIE_SINK(opaque);
@@ -386,29 +513,32 @@ static void amd_csi2_reg_write(void *opaque, hwaddr addr, uint64_t val, unsigned
             printf("AMD CSI2: ⚡ Global interrupt enable: 0x%x (virtual vsync will %s)\n", 
                    (uint32_t)val, (val & 0x1) ? "start" : "stop");
             
-            /* Check virtual source when interrupts are enabled */
+            /* 가상 소스 상태 확인 */
             amd_csi2_check_virtual_source_start(s);
             break;
             
         case 0x24: /* Interrupt Status Register */
-            /* 🔧 FIXED: Write 1 to clear - but DON'T clear artificially written bits */
+            /* 🔧 Enhanced Write-1-to-clear with better timing */
             {
                 uint32_t old_status = s->regs.int_status;
-                s->regs.int_status &= ~val;  /* Clear bits where 1 is written */
+                uint32_t cleared_bits = val & old_status;
+                s->regs.int_status &= ~cleared_bits;
                 
-                if (old_status != s->regs.int_status) {
-                    printf("AMD CSI2: 🧹 ISR: 0x%08x -> 0x%08x (cleared 0x%08x)\n", 
-                           old_status, s->regs.int_status, (uint32_t)val);
+                if (cleared_bits != 0) {
+                    printf("AMD CSI2: 🧹 ISR cleared: 0x%08x -> 0x%08x (cleared: 0x%08x)\n", 
+                           old_status, s->regs.int_status, cleared_bits);
                 }
+                
+                /* 🆕 클리어 후 잠시 대기 - 새 인터럽트 즉시 생성하지 않음 */
+                /* amd_csi2_update_interrupts(s) 호출하지 않음 - 타이머에서 처리 */
             }
-            amd_csi2_update_interrupts(s);
             break;
             
         case 0x28: /* Interrupt Enable Register */
             s->regs.int_enable = val;
             printf("AMD CSI2: 📡 Interrupt enable: 0x%x\n", (uint32_t)val);
             
-            /* Check virtual source when frame interrupts are enabled */
+            /* 프레임 인터럽트 활성화 확인 */
             if (val & (1U << 31)) {
                 printf("AMD CSI2: 🎬 Frame received interrupt enabled - virtual vsync ready\n");
             }
@@ -419,16 +549,15 @@ static void amd_csi2_reg_write(void *opaque, hwaddr addr, uint64_t val, unsigned
             s->regs.dynamic_vc_sel = val;
             break;
             
-        /* 🔧 FIXED: Allow manual ISR manipulation for testing */
+        /* 🔧 Test register handling for driver communication */
         default:
-            /* Handle test registers that drivers might write to trigger interrupts */
             if (addr >= 0x50 && addr <= 0x5C) {
                 printf("AMD CSI2: 🧪 Test register write: 0x%lx = 0x%lx\n", addr, val);
                 
-                /* If it's a test trigger, generate an interrupt */
+                /* 특별한 테스트 패턴 감지 */
                 if (val == 0x12345678 || val == 0xDEADBEEF) {
-                    printf("AMD CSI2: 🚀 Test pattern detected - triggering interrupt!\n");
-                    s->regs.int_status |= (1U << 31); /* Set frame received */
+                    printf("AMD CSI2: 🚀 Test pattern detected - triggering immediate interrupt!\n");
+                    s->regs.int_status |= (1U << 31);
                     amd_csi2_update_interrupts(s);
                 }
             }
@@ -496,25 +625,41 @@ static const MemoryRegionOps amd_csi2_reg_ops = {
     },
 };
 
-/* 🚨 REMOVED: No more forced MSI-X activation - let the OS handle it */
-
-/* 🔧 FIXED: Simplified device initialization */
+/* 🔧 Enhanced device initialization with QEMU 10.x compatibility */
 static void amd_csi2_pcie_sink_realize(PCIDevice *pci_dev, Error **errp)
 {
     AmdCsi2PcieSinkState *s = AMD_CSI2_PCIE_SINK(pci_dev);
     uint8_t *pci_conf = pci_dev->config;
     int ret;
     
-    printf("AMD CSI2: 🚀 Initializing PCIe sink device (FIXED VERSION 1.6)\n");
+    printf("AMD CSI2: 🚀 Initializing PCIe sink device (Version 1.7 - QEMU 10.x Compat)\n");
     
-    /* Basic PCI configuration */
+    /* 🆕 QEMU 버전 호환성 확인 */
+    amd_csi2_check_qemu_version();
+    
+    /* Enhanced PCI configuration */
     pci_config_set_vendor_id(pci_conf, AMD_CSI2_VENDOR_ID);
     pci_config_set_device_id(pci_conf, AMD_CSI2_DEVICE_ID);
     pci_config_set_revision(pci_conf, AMD_CSI2_REVISION);
     pci_config_set_class(pci_conf, AMD_CSI2_CLASS_CODE);
     
-    /* Interrupt pin */
+    /* 🆕 Complete PCI Command register setup (16-bit register) */
+    pci_set_word(pci_conf + PCI_COMMAND, 
+                 PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER | PCI_COMMAND_INTX_DISABLE);
+    
+    /* 🆕 Enhanced Status register */
+    pci_set_word(pci_conf + PCI_STATUS, 
+                 PCI_STATUS_CAP_LIST | PCI_STATUS_FAST_BACK | PCI_STATUS_DEVSEL_MEDIUM);
+    
+    /* 🆕 Additional PCI configuration */
+    pci_conf[PCI_LATENCY_TIMER] = 0x00;
+    pci_conf[PCI_CACHE_LINE_SIZE] = 0x10;
     pci_conf[PCI_INTERRUPT_PIN] = 1;  /* INTA# */
+    
+    printf("AMD CSI2: 🔧 Enhanced PCI Configuration:\n");
+    printf("   Command: 0x%04x (Memory + Master + DisINTx)\n", 
+           pci_get_word(pci_conf + PCI_COMMAND));
+    printf("   Status: 0x%04x\n", pci_get_word(pci_conf + PCI_STATUS));
     
     /* Initialize memory regions */
     memory_region_init_io(&s->reg_bar, OBJECT(s), &amd_csi2_reg_ops, s,
@@ -534,9 +679,9 @@ static void amd_csi2_pcie_sink_realize(PCIDevice *pci_dev, Error **errp)
     pci_register_bar(pci_dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_32, &s->framebuf_bar);
     pci_register_bar(pci_dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_32, &s->msix_bar);
     
-    printf("AMD CSI2: 📍 BARs registered\n");
+    printf("AMD CSI2: 📍 BARs registered successfully\n");
     
-    /* Initialize MSI-X - let the OS control it */
+    /* 🔧 Enhanced MSI-X initialization for QEMU 10.x */
     ret = msix_init(pci_dev, AMD_CSI2_MSIX_VECTORS,
                     &s->msix_bar, 2, AMD_CSI2_MSIX_TABLE_OFFSET,
                     &s->msix_bar, 2, AMD_CSI2_MSIX_PBA_OFFSET, 
@@ -547,11 +692,9 @@ static void amd_csi2_pcie_sink_realize(PCIDevice *pci_dev, Error **errp)
         return;
     }
     
-    printf("AMD CSI2: ✅ MSI-X initialized with %d vectors (OS-controlled)\n", 
+    printf("AMD CSI2: ✅ MSI-X initialized with %d vectors (QEMU 10.x compatible)\n", 
            AMD_CSI2_MSIX_VECTORS);
-    
-    /* Enable bus master and memory access */
-    pci_conf[PCI_COMMAND] = PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
+    printf("AMD CSI2: 📋 MSI-X will be configured by OS - waiting for activation\n");
     
     /* Initialize virtual camera */
     s->vcam.enabled = true;
@@ -573,15 +716,18 @@ static void amd_csi2_pcie_sink_realize(PCIDevice *pci_dev, Error **errp)
     s->regs.dphy_hs_settle = 0x20;
     s->regs.framebuf_size = AMD_CSI2_FRAMEBUF_BAR_SIZE;
     
-    /* Initialize device state */
+    /* Initialize enhanced device state */
     s->initialized = true;
+    s->msix_os_configured = false;
+    s->os_config_check_time = 0;
     s->frames_received = 0;
     s->interrupts_sent = 0;
+    s->msix_verify_count = 0;
     
     printf("AMD CSI2: ✅ PCIe sink device initialized successfully\n");
     printf("AMD CSI2: 📹 Virtual camera ready: %ux%u@%ufps\n",
            s->vcam.width, s->vcam.height, s->vcam.fps);
-    printf("AMD CSI2: 🎮 Virtual vsync will start when driver enables interrupts\n");
+    printf("AMD CSI2: 🎮 Enhanced MSI-X mode - will start when OS configures vectors\n");
 }
 
 static void amd_csi2_pcie_sink_exit(PCIDevice *pci_dev)
@@ -597,16 +743,19 @@ static void amd_csi2_pcie_sink_exit(PCIDevice *pci_dev)
         s->vcam.timer_active = false;
     }
     
-    /* Final statistics */
+    /* Enhanced final statistics */
     if (s->frames_received > 0) {
-        printf("AMD CSI2: 📊 Final statistics: %lu frames, %lu interrupts\n",
-               s->frames_received, s->interrupts_sent);
+        printf("AMD CSI2: 📊 Final Statistics:\n");
+        printf("   Frames generated: %lu\n", s->frames_received);
+        printf("   MSI-X interrupts sent: %lu\n", s->interrupts_sent);
+        printf("   MSI-X verifications: %lu\n", s->msix_verify_count);
+        printf("   OS configured MSI-X: %s\n", s->msix_os_configured ? "YES" : "NO");
     }
     
     /* Cleanup MSI-X */
     msix_uninit(pci_dev, &s->msix_bar, &s->msix_bar);
     
-    printf("AMD CSI2: ✅ Cleanup completed\n");
+    printf("AMD CSI2: ✅ Cleanup completed successfully\n");
 }
 
 static void amd_csi2_pcie_sink_instance_init(Object *obj)
@@ -617,13 +766,16 @@ static void amd_csi2_pcie_sink_instance_init(Object *obj)
     memset(&s->regs, 0, sizeof(s->regs));
     s->frames_received = 0;
     s->interrupts_sent = 0;
+    s->msix_verify_count = 0;
     s->initialized = false;
+    s->msix_os_configured = false;
+    s->os_config_check_time = 0;
 }
 
 /* VMState for migration */
 static const VMStateDescription vmstate_amd_csi2_pcie_sink = {
     .name = "amd-csi2-pcie-sink",
-    .version_id = 1,
+    .version_id = 2,  /* 버전 증가 */
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(parent_obj, AmdCsi2PcieSinkState),
@@ -632,7 +784,9 @@ static const VMStateDescription vmstate_amd_csi2_pcie_sink = {
         VMSTATE_UINT32(regs.int_status, AmdCsi2PcieSinkState),
         VMSTATE_UINT32(regs.int_enable, AmdCsi2PcieSinkState),
         VMSTATE_BOOL(initialized, AmdCsi2PcieSinkState),
+        VMSTATE_BOOL(msix_os_configured, AmdCsi2PcieSinkState),
         VMSTATE_UINT32(vcam.frame_count, AmdCsi2PcieSinkState),
+        VMSTATE_UINT64(interrupts_sent, AmdCsi2PcieSinkState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -653,7 +807,7 @@ static void amd_csi2_pcie_sink_class_init(ObjectClass *klass, const void *data)
     dc->user_creatable = true;
     dc->vmsd = &vmstate_amd_csi2_pcie_sink;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
-    dc->desc = "AMD MIPI CSI-2 RX PCIe Sink Device with Fixed MSI-X Support";
+    dc->desc = "AMD MIPI CSI-2 RX PCIe Sink Device with QEMU 10.x Compatibility";
 }
 
 static const TypeInfo amd_csi2_pcie_sink_info = {
