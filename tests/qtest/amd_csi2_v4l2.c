@@ -1,7 +1,7 @@
 /*
  * AMD MIPI CSI-2 RX Subsystem V4L2 Driver
- * Version 3.0 - Linux 6.15.4 Complete MSI-X Fix
- * 🚨 CRITICAL FIXES: Proper register mapping + MSI-X handling
+ * Version 4.0 - MSI-X TIMING AND INITIALIZATION FIX
+ * 🎯 FIXED: Proper initialization sequence and MSI-X handling
  */
 
 #include <linux/module.h>
@@ -30,13 +30,13 @@
 #include <media/videobuf2-dma-contig.h>
 
 #define DRIVER_NAME "amd_csi2_v4l2"
-#define DRIVER_VERSION "3.0"
+#define DRIVER_VERSION "4.0"
 
 /* PCI Device IDs */
 #define AMD_VENDOR_ID 0x1022
 #define AMD_CSI2_DEVICE_ID 0xC901
 
-/* 🆕 Complete AMD CSI-2 Register Definitions */
+/* Complete AMD CSI-2 Register Map (from spec) */
 #define CSI2_REG_CORE_CONFIG           0x00
 #define CSI2_REG_PROTOCOL_CONFIG       0x04
 #define CSI2_REG_CORE_STATUS           0x10
@@ -59,7 +59,7 @@
 #define CSI2_REG_DEBUG_CTRL            0x54
 #define CSI2_REG_FORCE_INT             0x58
 
-/* Image Information Registers (VC0-VC15) */
+/* Image Information Registers */
 #define CSI2_REG_IMG_INFO1_VC0         0x60
 #define CSI2_REG_IMG_INFO2_VC0         0x64
 
@@ -70,7 +70,7 @@
 #define CSI2_REG_DPHY_PLL_CTRL         0x100C
 #define CSI2_REG_DPHY_PLL_STATUS       0x1010
 
-/* 🆕 Register bit definitions from AMD CSI-2 spec */
+/* Register bit definitions (from AMD spec) */
 #define CORE_CONFIG_ENABLE             BIT(0)
 #define CORE_CONFIG_SOFT_RESET         BIT(1)
 #define CORE_CONFIG_FULL_RESET         BIT(2)
@@ -122,7 +122,6 @@ struct amd_csi2_dev {
     
     /* Hardware resources */
     void __iomem *mmio_base;
-    void __iomem *msix_base;
     int irq_vectors[AMD_CSI2_MSIX_VECTORS];
     int num_irq_vectors;
     int primary_irq;
@@ -146,7 +145,7 @@ struct amd_csi2_dev {
     u32 sequence;
     u32 frames_captured;
     
-    /* 🆕 Enhanced debugging and statistics */
+    /* Statistics and debugging */
     atomic_t total_interrupts;
     atomic_t frame_interrupts;
     atomic_t error_interrupts;
@@ -156,19 +155,20 @@ struct amd_csi2_dev {
     ktime_t driver_start_time;
     u32 last_isr_value;
     u32 last_core_status;
+    u32 init_sequence_step;
     
     /* Capture thread */
     struct task_struct *capture_thread;
     struct completion frame_completion;
     bool thread_should_stop;
     
-    /* 🆕 Hardware monitoring */
+    /* Hardware monitoring */
     struct timer_list hw_monitor_timer;
-    struct work_struct test_work;
+    struct work_struct hw_test_work;
     bool test_mode_active;
 };
 
-/* 🆕 Hardware register access helpers */
+/* Hardware register access helpers */
 static inline u32 csi2_read_reg(struct amd_csi2_dev *csi2_dev, u32 offset)
 {
     u32 val = readl(csi2_dev->mmio_base + offset);
@@ -183,15 +183,50 @@ static inline void csi2_write_reg(struct amd_csi2_dev *csi2_dev, u32 offset, u32
     atomic_inc(&csi2_dev->register_writes);
 }
 
-/* 🆕 Complete hardware verification */
+/* 🎯 FIXED: Simplified hardware test */
+static void amd_csi2_hardware_test(struct work_struct *work)
+{
+    struct amd_csi2_dev *csi2_dev = container_of(work, struct amd_csi2_dev, hw_test_work);
+    u32 test_value = 0x12345678;
+    
+    dev_info(&csi2_dev->pdev->dev, "🧪 Hardware communication test\n");
+    
+    /* Enable debug mode */
+    csi2_write_reg(csi2_dev, CSI2_REG_DEBUG_CTRL, 1);
+    
+    /* Write test trigger */
+    csi2_write_reg(csi2_dev, CSI2_REG_TEST_TRIGGER, test_value);
+    msleep(100);
+    
+    /* Read back */
+    u32 readback = csi2_read_reg(csi2_dev, CSI2_REG_TEST_TRIGGER);
+    
+    dev_info(&csi2_dev->pdev->dev, 
+             "📝 Test: wrote 0x%08x, read 0x%08x %s\n",
+             test_value, readback, 
+             (readback == test_value) ? "✅ OK" : "❌ FAIL");
+    
+    /* Force interrupt test */
+    dev_info(&csi2_dev->pdev->dev, "🚀 Triggering force interrupt\n");
+    csi2_write_reg(csi2_dev, CSI2_REG_FORCE_INT, 0xDEADBEEF);
+    msleep(200);
+    
+    u32 isr = csi2_read_reg(csi2_dev, CSI2_REG_ISR);
+    dev_info(&csi2_dev->pdev->dev, "📊 ISR after force: 0x%08x\n", isr);
+    
+    int total_interrupts = atomic_read(&csi2_dev->total_interrupts);
+    dev_info(&csi2_dev->pdev->dev, 
+             "📊 Total interrupts received: %d\n", total_interrupts);
+}
+
+/* Hardware verification */
 static void amd_csi2_verify_hardware(struct amd_csi2_dev *csi2_dev)
 {
     u32 core_config, core_status, global_int, ier;
     u32 dphy_status, dphy_pll_status;
     
-    dev_info(&csi2_dev->pdev->dev, "🔍 Complete Hardware Verification\n");
+    dev_info(&csi2_dev->pdev->dev, "🔍 Hardware Status Check\n");
     
-    /* Read all critical registers */
     core_config = csi2_read_reg(csi2_dev, CSI2_REG_CORE_CONFIG);
     core_status = csi2_read_reg(csi2_dev, CSI2_REG_CORE_STATUS);
     global_int = csi2_read_reg(csi2_dev, CSI2_REG_GLOBAL_INT_ENABLE);
@@ -216,7 +251,6 @@ static void amd_csi2_verify_hardware(struct amd_csi2_dev *csi2_dev)
              dphy_status, (dphy_status & 0x3) ? "YES" : "NO",
              dphy_pll_status, (dphy_pll_status & 0x3) ? "YES" : "NO");
     
-    /* Check if hardware is in expected state */
     csi2_dev->hardware_ready = (core_config & CORE_CONFIG_ENABLE) &&
                               (dphy_status & 0x3) &&
                               (dphy_pll_status & 0x3);
@@ -225,49 +259,7 @@ static void amd_csi2_verify_hardware(struct amd_csi2_dev *csi2_dev)
              csi2_dev->hardware_ready ? "YES" : "NO");
 }
 
-/* 🆕 Hardware test communication */
-static void amd_csi2_test_communication(struct work_struct *work)
-{
-    struct amd_csi2_dev *csi2_dev = container_of(work, struct amd_csi2_dev, test_work);
-    u32 test_patterns[] = {0x12345678, 0xCAFEBABE, 0xDEADBEEF};
-    int i;
-    
-    dev_info(&csi2_dev->pdev->dev, "🧪 Testing Hardware Communication\n");
-    
-    for (i = 0; i < ARRAY_SIZE(test_patterns); i++) {
-        u32 pattern = test_patterns[i];
-        u32 readback;
-        
-        /* Write test pattern */
-        csi2_write_reg(csi2_dev, CSI2_REG_TEST_TRIGGER, pattern);
-        msleep(10); /* Give QEMU time to process */
-        
-        /* Read back */
-        readback = csi2_read_reg(csi2_dev, CSI2_REG_TEST_TRIGGER);
-        
-        dev_info(&csi2_dev->pdev->dev,
-                 "📝 Test %d: wrote 0x%08x, read 0x%08x %s\n",
-                 i, pattern, readback, 
-                 (readback == pattern) ? "✅ OK" : "❌ FAIL");
-        
-        /* Try to trigger interrupt */
-        if (pattern == 0xDEADBEEF) {
-            csi2_write_reg(csi2_dev, CSI2_REG_FORCE_INT, pattern);
-            msleep(50); /* Wait for potential interrupt */
-        }
-    }
-    
-    /* Check for any new interrupts */
-    u32 isr = csi2_read_reg(csi2_dev, CSI2_REG_ISR);
-    if (isr != csi2_dev->last_isr_value) {
-        dev_info(&csi2_dev->pdev->dev,
-                 "🔔 ISR changed: 0x%08x -> 0x%08x\n",
-                 csi2_dev->last_isr_value, isr);
-        csi2_dev->last_isr_value = isr;
-    }
-}
-
-/* 🆕 Hardware monitoring timer */
+/* Hardware monitoring timer */
 static void amd_csi2_hw_monitor_timer(struct timer_list *timer)
 {
     struct amd_csi2_dev *csi2_dev = from_timer(csi2_dev, timer, hw_monitor_timer);
@@ -276,11 +268,9 @@ static void amd_csi2_hw_monitor_timer(struct timer_list *timer)
         return;
     }
     
-    /* Read current status */
     u32 core_status = csi2_read_reg(csi2_dev, CSI2_REG_CORE_STATUS);
     u32 isr = csi2_read_reg(csi2_dev, CSI2_REG_ISR);
     
-    /* Check for changes */
     bool status_changed = (core_status != csi2_dev->last_core_status);
     bool isr_changed = (isr != csi2_dev->last_isr_value);
     
@@ -293,19 +283,19 @@ static void amd_csi2_hw_monitor_timer(struct timer_list *timer)
         csi2_dev->last_isr_value = isr;
     }
     
-    /* Schedule test communication if no interrupts received */
+    /* Trigger test if no interrupts received for too long */
     if (atomic_read(&csi2_dev->total_interrupts) == 0 && !csi2_dev->test_mode_active) {
         csi2_dev->test_mode_active = true;
-        schedule_work(&csi2_dev->test_work);
+        schedule_work(&csi2_dev->hw_test_work);
     }
     
     /* Reschedule timer */
     if (csi2_dev->streaming) {
-        mod_timer(&csi2_dev->hw_monitor_timer, jiffies + msecs_to_jiffies(5000));
+        mod_timer(&csi2_dev->hw_monitor_timer, jiffies + msecs_to_jiffies(3000));
     }
 }
 
-/* 🆕 Enhanced MSI-X interrupt handler */
+/* Enhanced MSI-X interrupt handler */
 static irqreturn_t amd_csi2_interrupt(int irq, void *dev_id)
 {
     struct amd_csi2_dev *csi2_dev = dev_id;
@@ -326,9 +316,8 @@ static irqreturn_t amd_csi2_interrupt(int irq, void *dev_id)
     atomic_inc(&csi2_dev->total_interrupts);
     int total_count = atomic_read(&csi2_dev->total_interrupts);
     
-    /* 🎉 SUCCESS - Log every interrupt */
     dev_info(&csi2_dev->pdev->dev, 
-             "🎉 MSI-X IRQ %d (Vector %d) - Interrupt #%d! 🎉\n",
+             "🎉 MSI-X IRQ %d (Vector %d) - Interrupt #%d received! 🎉\n",
              irq, vector_idx, total_count);
     
     /* Special celebration for first interrupt */
@@ -364,10 +353,9 @@ static irqreturn_t amd_csi2_interrupt(int irq, void *dev_id)
         /* Clear all pending interrupts */
         csi2_write_reg(csi2_dev, CSI2_REG_ISR, isr_status);
         
-        dev_info(&csi2_dev->pdev->dev, "🧹 ISR cleared: 0x%08x\n", isr_status);
     } else {
         dev_info(&csi2_dev->pdev->dev, "📌 Spurious interrupt (ISR=0)\n");
-        handled = true; /* Still count as handled since it's our device */
+        handled = true; /* Still count as handled */
     }
     
     spin_unlock_irqrestore(&csi2_dev->lock, flags);
@@ -375,48 +363,61 @@ static irqreturn_t amd_csi2_interrupt(int irq, void *dev_id)
     return handled ? IRQ_HANDLED : IRQ_NONE;
 }
 
-/* 🆕 Complete hardware initialization */
+/* 🎯 FIXED: Proper hardware initialization sequence */
 static int amd_csi2_hw_init(struct amd_csi2_dev *csi2_dev)
 {
     u32 val;
     
-    dev_info(&csi2_dev->pdev->dev, "🔧 Complete CSI-2 Hardware Initialization\n");
+    dev_info(&csi2_dev->pdev->dev, "🔧 CSI-2 Hardware Initialization Sequence\n");
     
-    /* Step 1: Soft reset */
+    /* Step 1: Soft reset and clear */
+    dev_info(&csi2_dev->pdev->dev, "Step 1: Soft reset\n");
     csi2_write_reg(csi2_dev, CSI2_REG_CORE_CONFIG, CORE_CONFIG_SOFT_RESET);
-    msleep(10);
+    msleep(50);
+    csi2_write_reg(csi2_dev, CSI2_REG_CORE_CONFIG, 0);
+    msleep(50);
     
-    /* Step 2: Configure core */
-    val = CORE_CONFIG_ENABLE;
-    csi2_write_reg(csi2_dev, CSI2_REG_CORE_CONFIG, val);
-    
-    /* Step 3: Configure protocol (4 lanes) */
-    csi2_write_reg(csi2_dev, CSI2_REG_PROTOCOL_CONFIG, 0x3);
-    
-    /* Step 4: Configure D-PHY */
+    /* Step 2: Configure D-PHY first */
+    dev_info(&csi2_dev->pdev->dev, "Step 2: D-PHY configuration\n");
     csi2_write_reg(csi2_dev, CSI2_REG_DPHY_CONTROL, 0x1);
     csi2_write_reg(csi2_dev, CSI2_REG_DPHY_PLL_CTRL, 0x1);
     csi2_write_reg(csi2_dev, CSI2_REG_DPHY_HS_SETTLE, 0x20);
+    msleep(100);
     
-    /* Step 5: Setup interrupts carefully */
-    csi2_write_reg(csi2_dev, CSI2_REG_GLOBAL_INT_ENABLE, 0x0); /* Disable first */
-    csi2_write_reg(csi2_dev, CSI2_REG_ISR, 0xFFFFFFFF);        /* Clear all */
-    wmb();
+    /* Step 3: Configure protocol (4 lanes) */
+    dev_info(&csi2_dev->pdev->dev, "Step 3: Protocol configuration\n");
+    csi2_write_reg(csi2_dev, CSI2_REG_PROTOCOL_CONFIG, 0x3);
     
-    /* Step 6: Enable frame received interrupt */
+    /* Step 4: Enable core */
+    dev_info(&csi2_dev->pdev->dev, "Step 4: Enable core\n");
+    csi2_dev->init_sequence_step = 1;
+    val = CORE_CONFIG_ENABLE;
+    csi2_write_reg(csi2_dev, CSI2_REG_CORE_CONFIG, val);
+    msleep(100);
+    
+    /* Step 5: Setup and enable interrupts carefully */
+    dev_info(&csi2_dev->pdev->dev, "Step 5: Configure interrupts\n");
+    
+    /* Clear any pending interrupts */
+    csi2_write_reg(csi2_dev, CSI2_REG_ISR, 0xFFFFFFFF);
+    
+    /* Enable frame received interrupt */
+    csi2_dev->init_sequence_step = 2;
     csi2_write_reg(csi2_dev, CSI2_REG_IER, ISR_FRAME_RECEIVED);
-    wmb();
+    msleep(50);
     
-    /* Step 7: Enable global interrupts */
+    /* Enable global interrupts */
+    csi2_dev->init_sequence_step = 3;
     csi2_write_reg(csi2_dev, CSI2_REG_GLOBAL_INT_ENABLE, 0x1);
-    wmb();
+    msleep(100);
     
-    /* Step 8: Verify configuration */
+    /* Step 6: Verify configuration */
+    dev_info(&csi2_dev->pdev->dev, "Step 6: Verify configuration\n");
     amd_csi2_verify_hardware(csi2_dev);
     
-    /* Initialize timers and work queues */
+    /* Initialize monitoring and work queues */
     timer_setup(&csi2_dev->hw_monitor_timer, amd_csi2_hw_monitor_timer, 0);
-    INIT_WORK(&csi2_dev->test_work, amd_csi2_test_communication);
+    INIT_WORK(&csi2_dev->hw_test_work, amd_csi2_hardware_test);
     
     /* Initialize counters */
     atomic_set(&csi2_dev->total_interrupts, 0);
@@ -426,20 +427,24 @@ static int amd_csi2_hw_init(struct amd_csi2_dev *csi2_dev)
     atomic_set(&csi2_dev->register_writes, 0);
     
     csi2_dev->test_mode_active = false;
+    csi2_dev->init_sequence_step = 4;  /* Complete */
     csi2_dev->driver_start_time = ktime_get();
     
     dev_info(&csi2_dev->pdev->dev, "✅ Hardware initialization complete\n");
     
+    /* Schedule initial hardware test after a delay */
+    schedule_work(&csi2_dev->hw_test_work);
+    
     return 0;
 }
 
-/* 🆕 Enhanced MSI-X setup */
+/* 🎯 FIXED: Standard MSI-X setup without unnecessary table access */
 static int amd_csi2_setup_msix(struct amd_csi2_dev *csi2_dev)
 {
     struct pci_dev *pdev = csi2_dev->pdev;
     int ret, nvec, i;
     
-    dev_info(&pdev->dev, "🚀 Enhanced MSI-X Setup (Linux 6.15.4)\n");
+    dev_info(&pdev->dev, "🚀 Standard MSI-X Setup\n");
     
     /* Clear any existing IRQ vectors */
     pci_free_irq_vectors(pdev);
@@ -455,7 +460,7 @@ static int amd_csi2_setup_msix(struct amd_csi2_dev *csi2_dev)
     
     /* Allocate MSI-X vectors */
     ret = pci_alloc_irq_vectors(pdev, 1, min(nvec, AMD_CSI2_MSIX_VECTORS), 
-                                PCI_IRQ_MSIX | NR_IRQS_LEGACY);
+                                PCI_IRQ_MSIX | PCI_IRQ_AFFINITY);
     if (ret < 0) {
         dev_err(&pdev->dev, "❌ Failed to allocate MSI-X vectors: %d\n", ret);
         return ret;
@@ -484,14 +489,6 @@ static int amd_csi2_setup_msix(struct amd_csi2_dev *csi2_dev)
     dev_info(&pdev->dev, "✅ IRQ handler registered: Vector 0 -> IRQ %d\n", 
              csi2_dev->primary_irq);
     
-    /* Map MSI-X table for debugging (BAR 2) */
-    csi2_dev->msix_base = pci_ioremap_bar(pdev, 2);
-    if (csi2_dev->msix_base) {
-        dev_info(&pdev->dev, "📍 MSI-X table mapped at %p\n", csi2_dev->msix_base);
-    } else {
-        dev_warn(&pdev->dev, "⚠️  Could not map MSI-X table\n");
-    }
-    
     csi2_dev->msix_enabled = true;
     
     dev_info(&pdev->dev, 
@@ -517,11 +514,6 @@ static void amd_csi2_free_msix(struct amd_csi2_dev *csi2_dev)
             free_irq(csi2_dev->primary_irq, csi2_dev);
         }
         
-        if (csi2_dev->msix_base) {
-            iounmap(csi2_dev->msix_base);
-            csi2_dev->msix_base = NULL;
-        }
-        
         pci_free_irq_vectors(csi2_dev->pdev);
         csi2_dev->msix_enabled = false;
         csi2_dev->primary_irq = 0;
@@ -537,10 +529,10 @@ static int amd_csi2_capture_thread(void *data)
     unsigned long flags;
     int frame_count = 0;
     
-    dev_info(&csi2_dev->pdev->dev, "🎬 Enhanced Capture Thread Started\n");
+    dev_info(&csi2_dev->pdev->dev, "🎬 Capture Thread Started\n");
     
-    /* Initial hardware verification */
-    msleep(500);
+    /* Initial hardware verification after a delay */
+    msleep(1000);
     amd_csi2_verify_hardware(csi2_dev);
     
     /* Start hardware monitoring */
@@ -555,7 +547,7 @@ static int amd_csi2_capture_thread(void *data)
             if (ret == 0) {
                 dev_warn(&csi2_dev->pdev->dev, 
                         "⏰ Frame timeout (30s) - triggering test\n");
-                schedule_work(&csi2_dev->test_work);
+                schedule_work(&csi2_dev->hw_test_work);
             }
             continue;
         }
@@ -599,7 +591,7 @@ static int amd_csi2_capture_thread(void *data)
     
     /* Stop hardware monitoring */
     timer_delete_sync(&csi2_dev->hw_monitor_timer);
-    cancel_work_sync(&csi2_dev->test_work);
+    cancel_work_sync(&csi2_dev->hw_test_work);
     
     dev_info(&csi2_dev->pdev->dev, 
         "🎬 Capture thread stopped after %d frames\n", frame_count);
@@ -661,7 +653,7 @@ static int amd_csi2_start_streaming(struct vb2_queue *q, unsigned int count)
     unsigned long flags;
     int ret;
     
-    dev_info(&csi2_dev->pdev->dev, "🎬 Starting Enhanced Streaming\n");
+    dev_info(&csi2_dev->pdev->dev, "🎬 Starting Streaming\n");
     
     spin_lock_irqsave(&csi2_dev->lock, flags);
     csi2_dev->streaming = true;
@@ -674,7 +666,7 @@ static int amd_csi2_start_streaming(struct vb2_queue *q, unsigned int count)
     
     /* Start capture thread */
     csi2_dev->capture_thread = kthread_run(amd_csi2_capture_thread, csi2_dev,
-                                          "csi2_enhanced");
+                                          "csi2_capture");
     if (IS_ERR(csi2_dev->capture_thread)) {
         ret = PTR_ERR(csi2_dev->capture_thread);
         dev_err(&csi2_dev->pdev->dev, "❌ Failed to start capture thread: %d\n", ret);
@@ -682,7 +674,7 @@ static int amd_csi2_start_streaming(struct vb2_queue *q, unsigned int count)
         return ret;
     }
     
-    dev_info(&csi2_dev->pdev->dev, "✅ Enhanced streaming started\n");
+    dev_info(&csi2_dev->pdev->dev, "✅ Streaming started\n");
     return 0;
 }
 
@@ -692,7 +684,7 @@ static void amd_csi2_stop_streaming(struct vb2_queue *q)
     struct amd_csi2_buffer *buf, *tmp;
     unsigned long flags;
     
-    dev_info(&csi2_dev->pdev->dev, "⏹️  Stopping Enhanced Streaming\n");
+    dev_info(&csi2_dev->pdev->dev, "⏹️  Stopping Streaming\n");
     
     /* Stop capture thread */
     if (csi2_dev->capture_thread) {
@@ -747,7 +739,7 @@ static int amd_csi2_querycap(struct file *file, void *priv,
     struct amd_csi2_dev *csi2_dev = video_drvdata(file);
     
     strscpy(cap->driver, DRIVER_NAME, sizeof(cap->driver));
-    strscpy(cap->card, "AMD CSI2 Enhanced Camera", sizeof(cap->card));
+    strscpy(cap->card, "AMD CSI2 Camera", sizeof(cap->card));
     snprintf(cap->bus_info, sizeof(cap->bus_info), "PCI:%s", pci_name(csi2_dev->pdev));
     
     return 0;
@@ -816,7 +808,7 @@ static int amd_csi2_enum_input(struct file *file, void *priv,
         return -EINVAL;
     
     inp->type = V4L2_INPUT_TYPE_CAMERA;
-    strscpy(inp->name, "CSI2 Enhanced Camera", sizeof(inp->name));
+    strscpy(inp->name, "CSI2 Camera", sizeof(inp->name));
     inp->status = V4L2_IN_ST_NO_SIGNAL;
     
     return 0;
@@ -938,7 +930,7 @@ static int amd_csi2_init_device(struct amd_csi2_dev *csi2_dev)
     vdev->lock = &csi2_dev->lock_mutex;
     vdev->queue = q;
     vdev->v4l2_dev = &csi2_dev->v4l2_dev;
-    strscpy(vdev->name, "AMD CSI2 Enhanced Camera", sizeof(vdev->name));
+    strscpy(vdev->name, "AMD CSI2 Camera", sizeof(vdev->name));
     video_set_drvdata(vdev, csi2_dev);
     
     return 0;
@@ -950,8 +942,8 @@ static int amd_csi2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     struct amd_csi2_dev *csi2_dev;
     int ret;
     
-    dev_info(&pdev->dev, "🚀 AMD CSI2 Enhanced Driver v%s\n", DRIVER_VERSION);
-    dev_info(&pdev->dev, "🎯 Complete MSI-X Fix for Linux 6.15.4\n");
+    dev_info(&pdev->dev, "🚀 AMD CSI2 MSI-X TIMING FIX v%s\n", DRIVER_VERSION);
+    dev_info(&pdev->dev, "🎯 Fixed initialization sequence for Linux 6.15.4\n");
     
     csi2_dev = devm_kzalloc(&pdev->dev, sizeof(*csi2_dev), GFP_KERNEL);
     if (!csi2_dev)
@@ -1028,16 +1020,18 @@ static int amd_csi2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     
     csi2_dev->initialized = true;
     
-    dev_info(&pdev->dev, "🎉 AMD CSI2 Enhanced Driver v%s loaded successfully!\n", DRIVER_VERSION);
+    dev_info(&pdev->dev, "🎉 AMD CSI2 MSI-X TIMING FIX v%s loaded!\n", DRIVER_VERSION);
     dev_info(&pdev->dev, "📺 Video device: %s\n", video_device_node_name(&csi2_dev->vdev));
     dev_info(&pdev->dev, 
              "🏆 Configuration Summary:\n"
              "   Primary IRQ: %d\n"
              "   MSI-X vectors: %d\n"
              "   Hardware ready: %s\n"
+             "   Init sequence: %u/4\n"
              "   Ready for operation! 🚀\n",
              csi2_dev->primary_irq, csi2_dev->num_irq_vectors,
-             csi2_dev->hardware_ready ? "YES" : "INITIALIZING");
+             csi2_dev->hardware_ready ? "YES" : "INITIALIZING",
+             csi2_dev->init_sequence_step);
     
     return 0;
     
@@ -1061,7 +1055,7 @@ static void amd_csi2_remove(struct pci_dev *pdev)
 {
     struct amd_csi2_dev *csi2_dev = pci_get_drvdata(pdev);
     
-    dev_info(&pdev->dev, "🧹 Removing AMD CSI2 Enhanced Driver\n");
+    dev_info(&pdev->dev, "🧹 Removing AMD CSI2 MSI-X TIMING FIX Driver\n");
     
     if (csi2_dev->initialized) {
         if (csi2_dev->streaming) {
@@ -1070,7 +1064,7 @@ static void amd_csi2_remove(struct pci_dev *pdev)
         
         /* Stop hardware monitoring */
         timer_delete_sync(&csi2_dev->hw_monitor_timer);
-        cancel_work_sync(&csi2_dev->test_work);
+        cancel_work_sync(&csi2_dev->hw_test_work);
         
         /* Disable interrupts */
         csi2_write_reg(csi2_dev, CSI2_REG_GLOBAL_INT_ENABLE, 0);
@@ -1090,7 +1084,7 @@ static void amd_csi2_remove(struct pci_dev *pdev)
     pci_disable_device(pdev);
     
     dev_info(&pdev->dev, 
-             "✅ AMD CSI2 Enhanced Driver removed\n"
+             "✅ AMD CSI2 MSI-X TIMING FIX Driver removed\n"
              "📊 Final stats: %d interrupts, %u frames\n",
              atomic_read(&csi2_dev->total_interrupts),
              csi2_dev->frames_captured);
@@ -1113,21 +1107,21 @@ static struct pci_driver amd_csi2_pci_driver = {
 
 static int __init amd_csi2_init(void)
 {
-    pr_info("🚀 AMD CSI2 Enhanced V4L2 Driver v%s\n", DRIVER_VERSION);
-    pr_info("🎯 Complete MSI-X Fix for Linux 6.15.4 + QEMU 10.x\n");
+    pr_info("🚀 AMD CSI2 MSI-X TIMING FIX V4L2 Driver v%s\n", DRIVER_VERSION);
+    pr_info("🎯 Fixed initialization sequence for Linux 6.15.4 + QEMU 10.x\n");
     return pci_register_driver(&amd_csi2_pci_driver);
 }
 
 static void __exit amd_csi2_exit(void)
 {
     pci_unregister_driver(&amd_csi2_pci_driver);
-    pr_info("✅ AMD CSI2 Enhanced V4L2 Driver v%s unloaded\n", DRIVER_VERSION);
+    pr_info("✅ AMD CSI2 MSI-X TIMING FIX V4L2 Driver v%s unloaded\n", DRIVER_VERSION);
 }
 
 module_init(amd_csi2_init);
 module_exit(amd_csi2_exit);
 
-MODULE_DESCRIPTION("AMD MIPI CSI-2 RX Enhanced V4L2 Driver - Complete MSI-X Fix");
-MODULE_AUTHOR("AMD CSI2 Enhanced Team");
+MODULE_DESCRIPTION("AMD MIPI CSI-2 RX V4L2 Driver - MSI-X TIMING AND INITIALIZATION FIX");
+MODULE_AUTHOR("AMD CSI2 Team");
 MODULE_LICENSE("GPL v2");
 MODULE_VERSION(DRIVER_VERSION);

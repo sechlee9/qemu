@@ -1,8 +1,8 @@
 /*
  * AMD MIPI CSI-2 RX Subsystem PCIe Sink Device for QEMU
  * 
- * Version 2.2 - FINAL MSI-X FIX
- * 🚨 CRITICAL: Fixed initialization order and register access
+ * Version 3.1 - PCI INTERRUPT ROUTING FIX
+ * 🎯 FIXED: Added missing PCI interrupt pin configuration
  */
 
 #include "qemu/osdep.h"
@@ -36,27 +36,72 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmdCsi2PcieSinkState, AMD_CSI2_PCIE_SINK)
 #define AMD_CSI2_MSIX_TABLE_OFFSET      0x0000
 #define AMD_CSI2_MSIX_PBA_OFFSET        0x0800
 
-/* Register definitions */
+/* AMD CSI-2 Complete Register Map (from spec) */
 #define CSI2_REG_CORE_CONFIG           0x00
 #define CSI2_REG_PROTOCOL_CONFIG       0x04
 #define CSI2_REG_CORE_STATUS           0x10
 #define CSI2_REG_GLOBAL_INT_ENABLE     0x20
 #define CSI2_REG_ISR                   0x24
 #define CSI2_REG_IER                   0x28
+#define CSI2_REG_DYNAMIC_VC_SEL        0x2C
+#define CSI2_REG_GENERIC_SHORT_PACKET  0x30
+#define CSI2_REG_VCX_FRAME_ERROR       0x34
+#define CSI2_REG_CLK_LANE_INFO         0x3C
+
+/* Lane Information Registers */
+#define CSI2_REG_LANE0_INFO            0x40
+#define CSI2_REG_LANE1_INFO            0x44
+#define CSI2_REG_LANE2_INFO            0x48
+#define CSI2_REG_LANE3_INFO            0x4C
+
+/* Test/Debug registers */
 #define CSI2_REG_TEST_TRIGGER          0x50
 #define CSI2_REG_DEBUG_CTRL            0x54
 #define CSI2_REG_FORCE_INT             0x58
 
-/* Register bits */
-#define CORE_CONFIG_ENABLE             (1 << 0)
-#define CORE_CONFIG_SOFT_RESET         (1 << 1)
-#define ISR_FRAME_RECEIVED             (1U << 31)
+/* Image Information Registers (VC0-VC15) */
+#define CSI2_REG_IMG_INFO1_VC0         0x60
+#define CSI2_REG_IMG_INFO2_VC0         0x64
+#define CSI2_REG_IMG_INFO1_VC1         0x68
+#define CSI2_REG_IMG_INFO2_VC1         0x6C
+/* ... up to VC15 at 0xD8, 0xDC */
+
+/* D-PHY registers (0x1000 offset) */
+#define CSI2_REG_DPHY_CONTROL          0x1000
+#define CSI2_REG_DPHY_STATUS           0x1004
+#define CSI2_REG_DPHY_HS_SETTLE        0x1008
+#define CSI2_REG_DPHY_PLL_CTRL         0x100C
+#define CSI2_REG_DPHY_PLL_STATUS       0x1010
+
+/* Register bits (from AMD spec) */
+#define CORE_CONFIG_ENABLE             BIT(0)
+#define CORE_CONFIG_SOFT_RESET         BIT(1)
+#define CORE_CONFIG_FULL_RESET         BIT(2)
+
+/* ISR bits (complete from spec) */
+#define ISR_FRAME_RECEIVED             BIT(31)
+#define ISR_VCX_FRAME_ERROR            BIT(30)
+#define ISR_RX_SKEWCALHS               BIT(29)
+#define ISR_YUV420_WC_ERROR            BIT(28)
+#define ISR_PENDING_WRITE_FIFO         BIT(27)
+#define ISR_WC_CORRUPTION              BIT(22)
+#define ISR_INCORRECT_LANE_CONFIG      BIT(21)
+#define ISR_SHORT_PACKET_FIFO_FULL     BIT(20)
+#define ISR_SHORT_PACKET_FIFO_NOT_EMPTY BIT(19)
+#define ISR_STREAM_LINE_BUFFER_FULL    BIT(18)
+#define ISR_STOP_STATE                 BIT(17)
+#define ISR_SOT_ERROR                  BIT(13)
+#define ISR_SOT_SYNC_ERROR             BIT(12)
+#define ISR_ECC_2_BIT_ERROR            BIT(11)
+#define ISR_ECC_1_BIT_ERROR            BIT(10)
+#define ISR_CRC_ERROR                  BIT(9)
+#define ISR_UNSUPPORTED_DATA_TYPE      BIT(8)
 
 /* Virtual Camera */
 #define AMD_CSI2_VIRT_CAM_FPS           30
 #define AMD_CSI2_FRAME_INTERVAL_NS      (1000000000ULL / AMD_CSI2_VIRT_CAM_FPS)
 
-/* 🆕 Enhanced register state with proper initialization */
+/* Complete register state */
 typedef struct {
     uint32_t core_config;
     uint32_t protocol_config;
@@ -64,14 +109,30 @@ typedef struct {
     uint32_t global_int_enable;
     uint32_t int_status;
     uint32_t int_enable;
+    uint32_t dynamic_vc_sel;
+    uint32_t generic_short_packet;
+    uint32_t vcx_frame_error;
+    uint32_t clk_lane_info;
+    uint32_t lane_info[4];
     uint32_t test_trigger;
     uint32_t debug_ctrl;
     uint32_t force_int;
     
-    /* 🆕 Hardware state tracking */
-    bool driver_initialized;
-    bool driver_streaming;
-    uint32_t driver_access_count;
+    /* Image info for all VCs */
+    uint32_t img_info1[16];  /* VC0-VC15 */
+    uint32_t img_info2[16];  /* VC0-VC15 */
+    
+    /* D-PHY registers */
+    uint32_t dphy_control;
+    uint32_t dphy_status;
+    uint32_t dphy_hs_settle;
+    uint32_t dphy_pll_ctrl;
+    uint32_t dphy_pll_status;
+    
+    /* State tracking */
+    bool driver_connected;
+    bool streaming_active;
+    uint32_t init_phase;  /* 0=none, 1=core, 2=interrupts, 3=ready */
 } AmdCsi2Registers;
 
 /* Virtual Camera State */
@@ -79,9 +140,8 @@ typedef struct {
     bool enabled;
     uint32_t frame_count;
     QEMUTimer *frame_timer;
-    QEMUTimer *startup_timer;
     bool timer_active;
-    bool startup_complete;
+    uint64_t last_frame_time;
 } VirtualCamera;
 
 /* Main device state */
@@ -95,168 +155,105 @@ struct AmdCsi2PcieSinkState {
     AmdCsi2Registers regs;
     VirtualCamera vcam;
     
-    bool initialized;
-    bool msix_ready;
+    bool device_ready;
     uint64_t frames_generated;
     uint64_t interrupts_sent;
-    uint64_t test_triggers;
-    uint64_t startup_time;
+    uint64_t driver_accesses;
+    
+    /* 🆕 PCI 인터럽트 관련 */
+    bool pci_interrupt_configured;
+    bool msix_interrupt_enabled;
+    
+    /* Debug and monitoring */
+    bool debug_enabled;
+    uint64_t last_debug_time;
 };
 
 /* Forward declarations */
-static void amd_csi2_update_interrupts(AmdCsi2PcieSinkState *s);
+static void amd_csi2_trigger_interrupt(AmdCsi2PcieSinkState *s, uint32_t isr_bits);
 static void amd_csi2_virtual_camera_frame(void *opaque);
-static void amd_csi2_startup_timer(void *opaque);
-static void amd_csi2_start_virtual_camera(AmdCsi2PcieSinkState *s);
-static void amd_csi2_stop_virtual_camera(AmdCsi2PcieSinkState *s);
+static void amd_csi2_check_streaming_conditions(AmdCsi2PcieSinkState *s);
 
-/* 🆕 Enhanced MSI-X readiness with detailed logging */
-static bool amd_csi2_check_msix_ready(AmdCsi2PcieSinkState *s)
+/* 🎯 FIXED: Enhanced interrupt delivery with proper PCI routing */
+static void amd_csi2_trigger_interrupt(AmdCsi2PcieSinkState *s, uint32_t isr_bits)
 {
     PCIDevice *pci_dev = PCI_DEVICE(s);
     
-    if (!msix_enabled(pci_dev)) {
-        return false;
-    }
+    /* Set interrupt status bits */
+    s->regs.int_status |= isr_bits;
     
-    if (!pci_dev->msix_table) {
-        return false;
-    }
-    
-    /* Check Vector 0 configuration */
-    uint32_t *entry = (uint32_t *)(pci_dev->msix_table);
-    uint32_t addr_low = entry[0];
-    uint32_t addr_high = entry[1];
-    uint32_t msg_data = entry[2];
-    uint32_t vector_ctrl = entry[3];
-    
-    bool addr_valid = (addr_low != 0 || addr_high != 0);
-    bool unmasked = !(vector_ctrl & 1);
-    
-    if (addr_valid && unmasked && !s->msix_ready) {
-        s->msix_ready = true;
-        printf("AMD CSI2: 🎉 MSI-X Configuration Detected!\n");
-        printf("   Vector 0 Address: 0x%08x%08x\n", addr_high, addr_low);
-        printf("   Message Data: 0x%08x\n", msg_data);
-        printf("   Control: 0x%08x (unmasked)\n", vector_ctrl);
-        printf("   🚀 Ready for interrupt delivery!\n");
-        
-        /* 🆕 Start immediate frame generation when MSI-X is ready */
-        if (s->regs.driver_initialized) {
-            amd_csi2_start_virtual_camera(s);
-        }
-    }
-    
-    return addr_valid && unmasked;
-}
-
-/* 🆕 Enhanced interrupt sending with retry logic */
-static void amd_csi2_send_interrupt(AmdCsi2PcieSinkState *s)
-{
-    PCIDevice *pci_dev = PCI_DEVICE(s);
-    
-    if (!amd_csi2_check_msix_ready(s)) {
-        if (s->interrupts_sent == 0) {
-            printf("AMD CSI2: ⏳ MSI-X not ready yet, queueing interrupt\n");
-        }
-        return;
-    }
-    
-    if (msix_is_masked(pci_dev, 0)) {
-        printf("AMD CSI2: ⚠️  Vector 0 is masked, cannot send\n");
-        return;
-    }
-    
-    /* Send the interrupt */
-    msix_notify(pci_dev, 0);
-    s->interrupts_sent++;
-    
-    /* 🆕 Enhanced logging for first several interrupts */
-    if (s->interrupts_sent <= 10) {
-        printf("AMD CSI2: 🔔 MSI-X interrupt #%lu sent to Vector 0!\n", s->interrupts_sent);
-        
-        if (s->interrupts_sent == 1) {
-            printf("AMD CSI2: 🎉 FIRST SUCCESSFUL MSI-X INTERRUPT!\n");
-            printf("   🎯 QEMU -> Linux communication established!\n");
-        }
-    } else if (s->interrupts_sent % 30 == 0) {
-        printf("AMD CSI2: 📊 MSI-X interrupt milestone: %lu sent\n", s->interrupts_sent);
-    }
-}
-
-/* Update interrupts with enhanced condition checking */
-static void amd_csi2_update_interrupts(AmdCsi2PcieSinkState *s)
-{
+    /* Check global interrupt enable */
     if (!(s->regs.global_int_enable & 1)) {
+        if (s->debug_enabled) {
+            printf("AMD CSI2: Global interrupts disabled, not sending\n");
+        }
         return;
     }
     
+    /* Check enabled interrupts */
     uint32_t pending = s->regs.int_status & s->regs.int_enable;
-    if (pending != 0) {
-        amd_csi2_send_interrupt(s);
-    }
-}
-
-/* 🆕 Enhanced virtual camera management */
-static void amd_csi2_start_virtual_camera(AmdCsi2PcieSinkState *s)
-{
-    if (s->vcam.timer_active) {
+    if (pending == 0) {
+        if (s->debug_enabled) {
+            printf("AMD CSI2: No pending enabled interrupts\n");
+        }
         return;
     }
-    
-    bool core_enabled = (s->regs.core_config & CORE_CONFIG_ENABLE);
-    bool global_int = (s->regs.global_int_enable & 1);
-    bool frame_int = (s->regs.int_enable & ISR_FRAME_RECEIVED);
-    bool msix_ready = s->msix_ready;
-    bool driver_ready = s->regs.driver_initialized;
-    
-    printf("AMD CSI2: 🔍 Virtual camera start check:\n");
-    printf("   Core enabled: %s\n", core_enabled ? "YES" : "NO");
-    printf("   Global int: %s\n", global_int ? "YES" : "NO");
-    printf("   Frame int: %s\n", frame_int ? "YES" : "NO");
-    printf("   MSI-X ready: %s\n", msix_ready ? "YES" : "NO");
-    printf("   Driver ready: %s\n", driver_ready ? "YES" : "NO");
-    
-    if (core_enabled && global_int && frame_int && msix_ready && driver_ready) {
-        printf("AMD CSI2: 🎬 Starting Virtual Camera (1920x1080@30fps)\n");
-        printf("   🎯 All conditions met for interrupt generation!\n");
-        
-        s->vcam.timer_active = true;
-        
-        /* Start with immediate first frame */
-        timer_mod(s->vcam.frame_timer, 
-                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000000ULL); /* 100ms delay */
+    static uint64_t last_log_time = 0;
+    uint64_t current_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL); 
+
+    /* 🎯 FIXED: Proper MSI-X delivery with validation */
+    if (msix_enabled(pci_dev)) {
+        if (!msix_is_masked(pci_dev, 0)) {
+            msix_notify(pci_dev, 0);
+            s->interrupts_sent++;
+            s->msix_interrupt_enabled = true;
+            if (current_time - last_log_time >= 5000000000ULL || s->interrupts_sent <= 5) {
+		    printf("AMD CSI2: MSI-X interrupt sent (ISR=0x%08x, pending=0x%08x) #%lu\n",
+		 		    s->regs.int_status, pending, s->interrupts_sent);
+		    last_log_time = current_time;
+	    }
+        } else {
+            printf("AMD CSI2: MSI-X vector 0 is masked, interrupt not sent\n");
+        }
     } else {
-        printf("AMD CSI2: ⏳ Virtual camera waiting for conditions\n");
+        printf("AMD CSI2: MSI-X not enabled, interrupt not sent\n");
     }
 }
 
-static void amd_csi2_stop_virtual_camera(AmdCsi2PcieSinkState *s)
+/* 🎯 FIXED: Immediate streaming start on proper conditions */
+static void amd_csi2_check_streaming_conditions(AmdCsi2PcieSinkState *s)
 {
-    if (s->vcam.timer_active) {
-        printf("AMD CSI2: ⏹️  Stopping Virtual Camera\n");
+    bool core_enabled = (s->regs.core_config & CORE_CONFIG_ENABLE);
+    bool interrupts_enabled = (s->regs.global_int_enable & 1);
+    bool frame_int_enabled = (s->regs.int_enable & ISR_FRAME_RECEIVED);
+    
+    bool should_stream = core_enabled && interrupts_enabled && frame_int_enabled;
+    
+    if (should_stream && !s->vcam.timer_active) {
+        /* Start virtual camera immediately */
+        s->vcam.timer_active = true;
+        s->regs.streaming_active = true;
+        
+        /* First frame in 1 second */
+        timer_mod(s->vcam.frame_timer, 
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000000ULL);
+        
+        printf("AMD CSI2: Virtual camera started (streaming=true)\n");
+        
+        /* Send immediate test interrupt to verify connection */
+        amd_csi2_trigger_interrupt(s, ISR_FRAME_RECEIVED);
+        
+    } else if (!should_stream && s->vcam.timer_active) {
+        /* Stop virtual camera */
         timer_del(s->vcam.frame_timer);
         s->vcam.timer_active = false;
+        s->regs.streaming_active = false;
+        
+        printf("AMD CSI2: Virtual camera stopped\n");
     }
 }
 
-/* 🆕 Startup timer for delayed initialization */
-static void amd_csi2_startup_timer(void *opaque)
-{
-    AmdCsi2PcieSinkState *s = AMD_CSI2_PCIE_SINK(opaque);
-    
-    s->vcam.startup_complete = true;
-    
-    printf("AMD CSI2: 🚀 Startup sequence complete\n");
-    printf("   Checking for driver readiness...\n");
-    
-    /* Check if we can start virtual camera */
-    if (s->regs.driver_initialized) {
-        amd_csi2_start_virtual_camera(s);
-    }
-}
-
-/* 🆕 Enhanced virtual camera frame generation */
+/* Virtual camera frame generation */
 static void amd_csi2_virtual_camera_frame(void *opaque)
 {
     AmdCsi2PcieSinkState *s = AMD_CSI2_PCIE_SINK(opaque);
@@ -268,19 +265,18 @@ static void amd_csi2_virtual_camera_frame(void *opaque)
     /* Generate frame */
     s->vcam.frame_count++;
     s->frames_generated++;
+    s->vcam.last_frame_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     
-    /* Update status */
+    /* Update hardware registers to reflect frame capture */
     s->regs.core_status = (s->regs.core_status & 0xFFFF) | (s->vcam.frame_count << 16);
+    s->regs.img_info1[0] = (s->vcam.frame_count << 16) | 1920;  /* Line count + byte count */
+    s->regs.img_info2[0] = 0x2A;  /* RAW10 data type */
     
-    /* Set interrupt status */
-    s->regs.int_status |= ISR_FRAME_RECEIVED;
+    /* Trigger frame received interrupt */
+    amd_csi2_trigger_interrupt(s, ISR_FRAME_RECEIVED);
     
-    /* Send interrupt */
-    amd_csi2_update_interrupts(s);
-    
-    if (s->frames_generated <= 5) {
-        printf("AMD CSI2: 📹 Frame #%u generated (ISR=0x%08x)\n", 
-               s->vcam.frame_count, s->regs.int_status);
+    if (s->debug_enabled && (s->vcam.frame_count <= 5 || s->vcam.frame_count % 30 == 0)) {
+        printf("AMD CSI2: Frame #%u generated, interrupt sent\n", s->vcam.frame_count);
     }
     
     /* Schedule next frame */
@@ -290,14 +286,13 @@ static void amd_csi2_virtual_camera_frame(void *opaque)
     }
 }
 
-/* 🆕 Enhanced register read with proper initialization */
+/* Register read with complete mapping */
 static uint64_t amd_csi2_reg_read(void *opaque, hwaddr addr, unsigned size)
 {
     AmdCsi2PcieSinkState *s = AMD_CSI2_PCIE_SINK(opaque);
     uint32_t val = 0;
     
-    /* Track driver access */
-    s->regs.driver_access_count++;
+    s->driver_accesses++;
     
     switch (addr) {
     case CSI2_REG_CORE_CONFIG:
@@ -318,6 +313,24 @@ static uint64_t amd_csi2_reg_read(void *opaque, hwaddr addr, unsigned size)
     case CSI2_REG_IER:
         val = s->regs.int_enable;
         break;
+    case CSI2_REG_DYNAMIC_VC_SEL:
+        val = s->regs.dynamic_vc_sel;
+        break;
+    case CSI2_REG_GENERIC_SHORT_PACKET:
+        val = s->regs.generic_short_packet;
+        break;
+    case CSI2_REG_VCX_FRAME_ERROR:
+        val = s->regs.vcx_frame_error;
+        break;
+    case CSI2_REG_CLK_LANE_INFO:
+        val = s->regs.clk_lane_info;
+        break;
+    case CSI2_REG_LANE0_INFO:
+    case CSI2_REG_LANE1_INFO:
+    case CSI2_REG_LANE2_INFO:
+    case CSI2_REG_LANE3_INFO:
+        val = s->regs.lane_info[(addr - CSI2_REG_LANE0_INFO) / 4];
+        break;
     case CSI2_REG_TEST_TRIGGER:
         val = s->regs.test_trigger;
         break;
@@ -327,130 +340,182 @@ static uint64_t amd_csi2_reg_read(void *opaque, hwaddr addr, unsigned size)
     case CSI2_REG_FORCE_INT:
         val = s->regs.force_int;
         break;
+        
+    /* Image Information Registers for all VCs */
+    case CSI2_REG_IMG_INFO1_VC0 ... (CSI2_REG_IMG_INFO1_VC0 + 0x78):
+        if ((addr - CSI2_REG_IMG_INFO1_VC0) % 8 == 0) {
+            /* IMG_INFO1 registers */
+            int vc = (addr - CSI2_REG_IMG_INFO1_VC0) / 8;
+            val = s->regs.img_info1[vc];
+        } else {
+            /* IMG_INFO2 registers */
+            int vc = (addr - CSI2_REG_IMG_INFO2_VC0) / 8;
+            val = s->regs.img_info2[vc];
+        }
+        break;
+        
+    /* D-PHY registers */
+    case CSI2_REG_DPHY_CONTROL:
+        val = s->regs.dphy_control;
+        break;
+    case CSI2_REG_DPHY_STATUS:
+        val = s->regs.dphy_status;
+        break;
+    case CSI2_REG_DPHY_HS_SETTLE:
+        val = s->regs.dphy_hs_settle;
+        break;
+    case CSI2_REG_DPHY_PLL_CTRL:
+        val = s->regs.dphy_pll_ctrl;
+        break;
+    case CSI2_REG_DPHY_PLL_STATUS:
+        val = s->regs.dphy_pll_status;
+        break;
+        
     default:
+        val = 0;
         break;
     }
     
-    /* 🆕 Log first few register accesses */
-    if (s->regs.driver_access_count <= 20 || addr == CSI2_REG_ISR) {
-        printf("AMD CSI2: 📖 Read 0x%03lx = 0x%08x (access #%u)\n", 
-               addr, val, s->regs.driver_access_count);
+    /* Debug important register reads */
+    if (s->debug_enabled && (addr <= 0x50 || s->driver_accesses <= 20)) {
+        printf("AMD CSI2: Read  0x%04lx = 0x%08x\n", addr, val);
     }
     
     return val;
 }
 
-/* 🆕 Enhanced register write with immediate response */
+/* 🎯 FIXED: Register write with immediate response */
 static void amd_csi2_reg_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     AmdCsi2PcieSinkState *s = AMD_CSI2_PCIE_SINK(opaque);
+    uint32_t old_val;
     
-        printf("AMD CSI2: 📝 Write 0x%03lx = 0x%08x\n", addr, (uint32_t)val);
+    if (s->debug_enabled && (addr <= 0x50 || s->driver_accesses <= 20)) {
+        printf("AMD CSI2: Write 0x%04lx = 0x%08x\n", addr, (uint32_t)val);
+    }
     
     switch (addr) {
     case CSI2_REG_CORE_CONFIG:
-        {
-            uint32_t old_val = s->regs.core_config;
-            s->regs.core_config = val;
-            
-            if ((val & CORE_CONFIG_ENABLE) && !(old_val & CORE_CONFIG_ENABLE)) {
-                printf("AMD CSI2: 🔧 Core enabled by driver\n");
-                s->regs.driver_initialized = true;
-                
-                /* Check if we can start virtual camera */
-                if (s->vcam.startup_complete) {
-                    amd_csi2_start_virtual_camera(s);
-                }
+        old_val = s->regs.core_config;
+        s->regs.core_config = val;
+        
+        if (val & CORE_CONFIG_SOFT_RESET) {
+            /* Soft reset */
+            s->regs.int_status = 0;
+            s->regs.core_config &= ~CORE_CONFIG_SOFT_RESET;
+            s->regs.init_phase = 0;
+            if (s->vcam.timer_active) {
+                timer_del(s->vcam.frame_timer);
+                s->vcam.timer_active = false;
             }
-            
-            if (val & CORE_CONFIG_SOFT_RESET) {
-                printf("AMD CSI2: 🔄 Soft reset by driver\n");
-                s->regs.int_status = 0;
-                s->regs.core_config &= ~CORE_CONFIG_SOFT_RESET;
-                amd_csi2_stop_virtual_camera(s);
-            }
+            printf("AMD CSI2: Soft reset executed\n");
         }
+        
+        if ((val & CORE_CONFIG_ENABLE) && !(old_val & CORE_CONFIG_ENABLE)) {
+            s->regs.driver_connected = true;
+            s->regs.init_phase = 1;
+            printf("AMD CSI2: Core enabled - driver connected\n");
+        }
+        
+        amd_csi2_check_streaming_conditions(s);
         break;
         
     case CSI2_REG_PROTOCOL_CONFIG:
         s->regs.protocol_config = val;
-        printf("AMD CSI2: 🛤️  Protocol config: 0x%x\n", (uint32_t)val);
         break;
         
     case CSI2_REG_GLOBAL_INT_ENABLE:
-        {
-            uint32_t old_val = s->regs.global_int_enable;
-            s->regs.global_int_enable = val;
-            
-            printf("AMD CSI2: ⚡ Global interrupt enable: 0x%x\n", (uint32_t)val);
-            
-            if ((val & 1) && !(old_val & 1)) {
-                printf("AMD CSI2: 🔔 Global interrupts enabled by driver\n");
-                amd_csi2_start_virtual_camera(s);
-            } else if (!(val & 1) && (old_val & 1)) {
-                printf("AMD CSI2: 🔕 Global interrupts disabled by driver\n");
-                amd_csi2_stop_virtual_camera(s);
-            }
+        old_val = s->regs.global_int_enable;
+        s->regs.global_int_enable = val;
+        
+        if ((val & 1) && !(old_val & 1)) {
+            s->regs.init_phase = 2;
+            printf("AMD CSI2: Global interrupts enabled\n");
         }
+        
+        amd_csi2_check_streaming_conditions(s);
         break;
         
     case CSI2_REG_ISR:
         /* Write-1-to-clear */
-        {
-            uint32_t old_status = s->regs.int_status;
-            uint32_t cleared = val & old_status;
-            s->regs.int_status &= ~cleared;
-            
-            if (cleared != 0) {
-                printf("AMD CSI2: 🧹 ISR cleared: 0x%08x -> 0x%08x (cleared: 0x%08x)\n", 
-                       old_status, s->regs.int_status, cleared);
-            }
-        }
+        s->regs.int_status &= ~val;
         break;
         
     case CSI2_REG_IER:
-        {
-            uint32_t old_val = s->regs.int_enable;
-            s->regs.int_enable = val;
-            
-            printf("AMD CSI2: 📡 Interrupt enable: 0x%x\n", (uint32_t)val);
-            
-            if ((val & ISR_FRAME_RECEIVED) && !(old_val & ISR_FRAME_RECEIVED)) {
-                printf("AMD CSI2: 🎬 Frame interrupt enabled by driver\n");
-                s->regs.driver_streaming = true;
-                amd_csi2_start_virtual_camera(s);
-            }
+        old_val = s->regs.int_enable;
+        s->regs.int_enable = val;
+        
+        if ((val & ISR_FRAME_RECEIVED) && !(old_val & ISR_FRAME_RECEIVED)) {
+            s->regs.init_phase = 3;
+            printf("AMD CSI2: Frame interrupts enabled - ready for streaming\n");
         }
+        
+        amd_csi2_check_streaming_conditions(s);
+        
+        /* Check for pending interrupts after enable change */
+        if (s->regs.int_status & val) {
+            amd_csi2_trigger_interrupt(s, 0);  /* Re-trigger existing pending */
+        }
+        break;
+        
+    case CSI2_REG_DYNAMIC_VC_SEL:
+        s->regs.dynamic_vc_sel = val;
+        break;
+        
+    case CSI2_REG_VCX_FRAME_ERROR:
+        s->regs.vcx_frame_error = val;
+        break;
+        
+    case CSI2_REG_LANE0_INFO:
+    case CSI2_REG_LANE1_INFO:
+    case CSI2_REG_LANE2_INFO:
+    case CSI2_REG_LANE3_INFO:
+        s->regs.lane_info[(addr - CSI2_REG_LANE0_INFO) / 4] = val;
         break;
         
     case CSI2_REG_TEST_TRIGGER:
         s->regs.test_trigger = val;
-        s->test_triggers++;
-        printf("AMD CSI2: 🧪 Test trigger: 0x%x (#%lu)\n", (uint32_t)val, s->test_triggers);
+        printf("AMD CSI2: Test trigger = 0x%08x\n", (uint32_t)val);
         
-        /* Immediate test response */
-        if (val == 0x12345678 || val == 0xDEADBEEF) {
-            printf("AMD CSI2: 🚀 Test pattern detected - IMMEDIATE interrupt!\n");
-            s->regs.int_status |= ISR_FRAME_RECEIVED;
-            amd_csi2_update_interrupts(s);
+        /* Immediate test interrupt for any non-zero value */
+        if (val != 0) {
+            amd_csi2_trigger_interrupt(s, ISR_FRAME_RECEIVED);
         }
         break;
         
     case CSI2_REG_DEBUG_CTRL:
         s->regs.debug_ctrl = val;
-        printf("AMD CSI2: 🔍 Debug control: 0x%x\n", (uint32_t)val);
+        s->debug_enabled = (val & 1) ? true : false;
+        printf("AMD CSI2: Debug mode %s\n", s->debug_enabled ? "enabled" : "disabled");
         break;
         
     case CSI2_REG_FORCE_INT:
         s->regs.force_int = val;
-        printf("AMD CSI2: ⚡ Force interrupt: 0x%x\n", (uint32_t)val);
+        printf("AMD CSI2: Force interrupt = 0x%08x\n", (uint32_t)val);
         
-        /* Immediate forced interrupt */
-        if (val == 0xDEADBEEF) {
-            printf("AMD CSI2: 💥 FORCED interrupt triggered!\n");
-            s->regs.int_status |= ISR_FRAME_RECEIVED;
-            amd_csi2_update_interrupts(s);
+        /* Force interrupt for any non-zero value */
+        if (val != 0) {
+            amd_csi2_trigger_interrupt(s, ISR_FRAME_RECEIVED);
         }
+        break;
+        
+    /* D-PHY registers */
+    case CSI2_REG_DPHY_CONTROL:
+        s->regs.dphy_control = val;
+        if (val & 1) {
+            s->regs.dphy_status = 0x3;  /* Ready */
+        }
+        break;
+        
+    case CSI2_REG_DPHY_PLL_CTRL:
+        s->regs.dphy_pll_ctrl = val;
+        if (val & 1) {
+            s->regs.dphy_pll_status = 0x3;  /* Locked */
+        }
+        break;
+        
+    case CSI2_REG_DPHY_HS_SETTLE:
+        s->regs.dphy_hs_settle = val;
         break;
         
     default:
@@ -468,14 +533,14 @@ static const MemoryRegionOps amd_csi2_reg_ops = {
     },
 };
 
-/* Device realization */
+/* 🎯 FIXED: Device realization with proper PCI interrupt configuration */
 static void amd_csi2_pcie_sink_realize(PCIDevice *pci_dev, Error **errp)
 {
     AmdCsi2PcieSinkState *s = AMD_CSI2_PCIE_SINK(pci_dev);
     uint8_t *pci_conf = pci_dev->config;
     int ret;
     
-    printf("AMD CSI2: 🚀 Initializing FINAL MSI-X Device v2.2\n");
+    printf("AMD CSI2: PCI INTERRUPT ROUTING FIX v3.1\n");
     
     /* PCI configuration */
     pci_config_set_vendor_id(pci_conf, AMD_CSI2_VENDOR_ID);
@@ -483,12 +548,15 @@ static void amd_csi2_pcie_sink_realize(PCIDevice *pci_dev, Error **errp)
     pci_config_set_revision(pci_conf, AMD_CSI2_REVISION);
     pci_config_set_class(pci_conf, AMD_CSI2_CLASS_CODE);
     
+    /* 🎯 CRITICAL FIX: Set PCI interrupt configuration */
     pci_set_word(pci_conf + PCI_COMMAND, 
                  PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER | PCI_COMMAND_INTX_DISABLE);
     pci_set_word(pci_conf + PCI_STATUS, 
                  PCI_STATUS_CAP_LIST | PCI_STATUS_FAST_BACK);
     
-    printf("AMD CSI2: 🔧 PCI Config: 1022:c901 class=0x0480\n");
+    /* 🆕 CRITICAL: Set interrupt pin (INTA) */
+    pci_config_set_interrupt_pin(pci_conf, 1);  /* INTA = 1 */
+    printf("AMD CSI2: PCI interrupt pin configured (INTA)\n");
     
     /* Initialize memory regions */
     memory_region_init_io(&s->reg_bar, OBJECT(s), &amd_csi2_reg_ops, s,
@@ -508,76 +576,71 @@ static void amd_csi2_pcie_sink_realize(PCIDevice *pci_dev, Error **errp)
     pci_register_bar(pci_dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->framebuf_bar);
     pci_register_bar(pci_dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->msix_bar);
     
-    /* MSI-X initialization */
+    /* 🎯 FIXED: MSI-X initialization with proper capability offset */
     ret = msix_init(pci_dev, AMD_CSI2_MSIX_VECTORS,
                     &s->msix_bar, 2, AMD_CSI2_MSIX_TABLE_OFFSET,
                     &s->msix_bar, 2, AMD_CSI2_MSIX_PBA_OFFSET, 
                     0x60, errp);
     if (ret < 0) {
-        printf("AMD CSI2: ❌ MSI-X init failed: %d\n", ret);
+        printf("AMD CSI2: MSI-X init failed: %d\n", ret);
         return;
     }
     
-    printf("AMD CSI2: ✅ MSI-X initialized with %d vectors\n", AMD_CSI2_MSIX_VECTORS);
+    /* 🆕 Mark PCI interrupt as configured */
+    s->pci_interrupt_configured = true;
+    s->msix_interrupt_enabled = false;
     
-    /* 🆕 Initialize registers with proper defaults */
-    s->regs.core_config = CORE_CONFIG_ENABLE;
-    s->regs.protocol_config = 0x3;
-    s->regs.core_status = 0x1000; /* Some initial packet count */
-    s->regs.global_int_enable = 0;
+    printf("AMD CSI2: MSI-X initialized with %d vectors\n", AMD_CSI2_MSIX_VECTORS);
+    
+    /* Initialize registers with proper defaults */
+    memset(&s->regs, 0, sizeof(s->regs));
+    s->regs.core_config = 0;  /* Disabled */
+    s->regs.protocol_config = 0x3;  /* 4 lanes */
+    s->regs.core_status = 0x1000;  /* Base status */
+    s->regs.global_int_enable = 0;  /* Disabled */
     s->regs.int_status = 0;
-    s->regs.int_enable = 0;
-    s->regs.driver_initialized = false;
-    s->regs.driver_streaming = false;
-    s->regs.driver_access_count = 0;
+    s->regs.int_enable = 0;  /* Disabled */
+    s->regs.dynamic_vc_sel = 0xFFFF;  /* All VCs enabled */
+    s->regs.dphy_status = 0x3;  /* Ready */
+    s->regs.dphy_pll_status = 0x3;  /* Locked */
+    s->regs.init_phase = 0;
     
     /* Initialize virtual camera */
     s->vcam.enabled = true;
     s->vcam.frame_count = 0;
     s->vcam.timer_active = false;
-    s->vcam.startup_complete = false;
+    s->vcam.last_frame_time = 0;
     s->vcam.frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, 
                                       amd_csi2_virtual_camera_frame, s);
-    s->vcam.startup_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                        amd_csi2_startup_timer, s);
     
-    /* Initialize state */
-    s->initialized = true;
-    s->msix_ready = false;
+    /* Initialize device state */
+    s->device_ready = true;
     s->frames_generated = 0;
     s->interrupts_sent = 0;
-    s->test_triggers = 0;
-    s->startup_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->driver_accesses = 0;
+    s->debug_enabled = true;  /* Start with debug enabled */
+    s->last_debug_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     
-    /* 🆕 Start startup timer (5 second delay for driver to initialize) */
-    timer_mod(s->vcam.startup_timer, s->startup_time + 5000000000ULL);
-    
-    printf("AMD CSI2: ✅ Device initialization complete\n");
-    printf("AMD CSI2: 🎯 Waiting for driver connection...\n");
-    printf("AMD CSI2: ⏰ Startup timer set for 5 seconds\n");
+    printf("AMD CSI2: Device ready - PCI interrupt configured, MSI-X vectors: %d\n", 
+           AMD_CSI2_MSIX_VECTORS);
 }
 
 static void amd_csi2_pcie_sink_exit(PCIDevice *pci_dev)
 {
     AmdCsi2PcieSinkState *s = AMD_CSI2_PCIE_SINK(pci_dev);
     
-    printf("AMD CSI2: 🧹 Device cleanup\n");
-    
-    amd_csi2_stop_virtual_camera(s);
+    if (s->vcam.timer_active) {
+        timer_del(s->vcam.frame_timer);
+    }
     
     if (s->vcam.frame_timer) {
         timer_free(s->vcam.frame_timer);
     }
     
-    if (s->vcam.startup_timer) {
-        timer_free(s->vcam.startup_timer);
-    }
-    
-    printf("AMD CSI2: 📊 FINAL STATS: frames=%lu, interrupts=%lu, tests=%lu\n",
-           s->frames_generated, s->interrupts_sent, s->test_triggers);
+    printf("AMD CSI2: Device removed - Frames: %lu, Interrupts: %lu, Accesses: %lu\n",
+           s->frames_generated, s->interrupts_sent, s->driver_accesses);
     
     msix_uninit(pci_dev, &s->msix_bar, &s->msix_bar);
-    printf("AMD CSI2: ✅ Cleanup complete\n");
 }
 
 static void amd_csi2_pcie_sink_instance_init(Object *obj)
@@ -585,25 +648,30 @@ static void amd_csi2_pcie_sink_instance_init(Object *obj)
     AmdCsi2PcieSinkState *s = AMD_CSI2_PCIE_SINK(obj);
     
     memset(&s->regs, 0, sizeof(s->regs));
-    s->initialized = false;
-    s->msix_ready = false;
+    memset(&s->vcam, 0, sizeof(s->vcam));
+    s->device_ready = false;
     s->frames_generated = 0;
     s->interrupts_sent = 0;
-    s->test_triggers = 0;
-    s->startup_time = 0;
+    s->driver_accesses = 0;
+    s->debug_enabled = false;
+    s->last_debug_time = 0;
+    s->pci_interrupt_configured = false;
+    s->msix_interrupt_enabled = false;
 }
 
 /* VMState for migration */
 static const VMStateDescription vmstate_amd_csi2_pcie_sink = {
     .name = "amd-csi2-pcie-sink",
-    .version_id = 5,
+    .version_id = 11,
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(parent_obj, AmdCsi2PcieSinkState),
         VMSTATE_UINT32(regs.core_config, AmdCsi2PcieSinkState),
         VMSTATE_UINT32(regs.int_status, AmdCsi2PcieSinkState),
-        VMSTATE_BOOL(initialized, AmdCsi2PcieSinkState),
+        VMSTATE_BOOL(device_ready, AmdCsi2PcieSinkState),
         VMSTATE_UINT32(vcam.frame_count, AmdCsi2PcieSinkState),
+        VMSTATE_UINT64(interrupts_sent, AmdCsi2PcieSinkState),
+        VMSTATE_BOOL(pci_interrupt_configured, AmdCsi2PcieSinkState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -624,7 +692,7 @@ static void amd_csi2_pcie_sink_class_init(ObjectClass *klass, const void *data)
     dc->user_creatable = true;
     dc->vmsd = &vmstate_amd_csi2_pcie_sink;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
-    dc->desc = "AMD MIPI CSI-2 RX PCIe Sink Device (FINAL MSI-X FIX)";
+    dc->desc = "AMD MIPI CSI-2 RX PCIe Sink Device (v3.1 - PCI INTERRUPT ROUTING FIX)";
 }
 
 static const TypeInfo amd_csi2_pcie_sink_info = {
