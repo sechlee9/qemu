@@ -1,4 +1,5 @@
 /*
+ * amd_csi2_dphy_core.h - Kernel version  
  * AMD MIPI D-PHY/RX C-PHY/D-PHY Core Register Definitions
  * Based on AMD CSI-2 RX Subsystem Product Guide (PG232)
  * 
@@ -9,8 +10,7 @@
 #ifndef AMD_CSI2_DPHY_CORE_H
 #define AMD_CSI2_DPHY_CORE_H
 
-#include <stdint.h>
-#include <stdbool.h>
+#include <linux/types.h>
 
 /* QEMU compatibility definitions */
 #ifndef BIT
@@ -220,43 +220,43 @@
 #define DPHY_DATA_LANE_REG(lane)               (DPHY_DATA_LANE0_REG + ((lane) * 4))
 
 /* Helper functions for field extraction and setting */
-static inline uint32_t dphy_get_num_lanes(uint32_t config)
+static inline u32 dphy_get_num_lanes(u32 config)
 {
     return (config & DPHY_LANE_CONFIG_NUM_LANES_MASK) + 1;
 }
 
-static inline uint32_t dphy_set_num_lanes(uint32_t config, uint32_t lanes)
+static inline u32 dphy_set_num_lanes(u32 config, u32 lanes)
 {
     config &= ~DPHY_LANE_CONFIG_NUM_LANES_MASK;
     config |= (lanes - 1) & DPHY_LANE_CONFIG_NUM_LANES_MASK;
     return config;
 }
 
-static inline bool dphy_is_pll_locked(uint32_t status)
+static inline bool dphy_is_pll_locked(u32 status)
 {
     return !!(status & DPHY_STATUS_PLL_LOCK);
 }
 
-static inline bool dphy_is_init_done(uint32_t status)
+static inline bool dphy_is_init_done(u32 status)
 {
     return !!(status & DPHY_STATUS_INIT_DONE);
 }
 
-static inline bool dphy_is_stopstate_clk(uint32_t status)
+static inline bool dphy_is_stopstate_clk(u32 status)
 {
     return !!(status & DPHY_STATUS_STOPSTATE_CLK);
 }
 
-static inline uint32_t dphy_get_stopstate_data(uint32_t status)
+static inline u32 dphy_get_stopstate_data(u32 status)
 {
     return (status & DPHY_STATUS_STOPSTATE_DATA_MASK) >> 5;
 }
 
-static inline uint32_t dphy_calculate_hs_settle(uint32_t line_rate_mbps)
+static inline u32 dphy_calculate_hs_settle(u32 line_rate_mbps)
 {
     /* HS_SETTLE = 135ns + 10*UI for typical case */
-    uint32_t bit_period_ns = 1000 / line_rate_mbps;
-    uint32_t settle_time_ns = 135 + (10 * bit_period_ns);
+    u32 bit_period_ns = 1000 / line_rate_mbps;
+    u32 settle_time_ns = 135 + (10 * bit_period_ns);
     return DPHY_HS_SETTLE_NS_TO_VALUE(settle_time_ns, bit_period_ns);
 }
 

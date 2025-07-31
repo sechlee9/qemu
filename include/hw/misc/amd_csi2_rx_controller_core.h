@@ -1,4 +1,5 @@
 /*
+ * amd_csi2_rx_controller_core.h - Kernel version
  * AMD MIPI CSI-2 RX Controller Core Register Definitions
  * Based on AMD CSI-2 RX Subsystem Product Guide (PG232)
  * 
@@ -9,7 +10,7 @@
 #ifndef AMD_CSI2_RX_CONTROLLER_CORE_H
 #define AMD_CSI2_RX_CONTROLLER_CORE_H
 
-#include <stdint.h>
+#include <linux/types.h>
 
 /* QEMU compatibility definitions */
 #ifndef BIT
@@ -228,37 +229,37 @@
 #define CSI2_LANE_INFO_REG(lane)   (CSI2_LANE0_INFO_REG + ((lane) * 4))
 
 /* Helper functions for field extraction */
-static inline uint32_t csi2_get_packet_count(uint32_t status)
+static inline u32 csi2_get_packet_count(u32 status)
 {
     return (status & CSI2_CORE_STATUS_PACKET_COUNT_MASK) >> 16;
 }
 
-static inline uint32_t csi2_get_line_count(uint32_t info1)
+static inline u32 csi2_get_line_count(u32 info1)
 {
     return (info1 & CSI2_IMG_INFO1_LINE_COUNT_MASK) >> 16;
 }
 
-static inline uint32_t csi2_get_byte_count(uint32_t info1)
+static inline u32 csi2_get_byte_count(u32 info1)
 {
     return info1 & CSI2_IMG_INFO1_BYTE_COUNT_MASK;
 }
 
-static inline uint32_t csi2_get_data_type(uint32_t info2)
+static inline u32 csi2_get_data_type(u32 info2)
 {
     return info2 & CSI2_IMG_INFO2_DATA_TYPE_MASK;
 }
 
-static inline uint32_t csi2_get_short_packet_data(uint32_t packet)
+static inline u32 csi2_get_short_packet_data(u32 packet)
 {
     return (packet & CSI2_GENERIC_SHORT_PACKET_DATA_MASK) >> 8;
 }
 
-static inline uint32_t csi2_get_short_packet_vc(uint32_t packet)
+static inline u32 csi2_get_short_packet_vc(u32 packet)
 {
     return (packet & CSI2_GENERIC_SHORT_PACKET_VC_MASK) >> 6;
 }
 
-static inline uint32_t csi2_get_short_packet_dt(uint32_t packet)
+static inline u32 csi2_get_short_packet_dt(u32 packet)
 {
     return packet & CSI2_GENERIC_SHORT_PACKET_DT_MASK;
 }

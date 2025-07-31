@@ -1,0 +1,424 @@
+/*
+ * AMD CSI-2 RX PCIe Device for QEMU (v5.1 - Build Fix)
+ *
+ * v5.1 Changes:
+ * - Removed unnecessary include of "qemu/qemu-halloc.h" to fix build error.
+ */
+#include "qemu/osdep.h"
+#include "qemu/log.h"
+#include "qemu/module.h"
+#include "qemu/timer.h"
+#include "qemu/main-loop.h"  // qemu_bh_* 함수들을 위해 추가
+#include "qemu/error-report.h"  // error_report를 위해 추가
+#include "sys/queue.h"
+#include "hw/pci/pci.h"
+#include "hw/pci/msi.h"
+#include "hw/pci/msix.h"
+#include "hw/qdev-properties.h"
+#include "hw/resettable.h"
+#include "migration/vmstate.h"
+#include "qapi/error.h"
+
+#define TYPE_AMD_CSI2_RX_PCIE "csi2-pcie-sink"
+#define AMD_CSI2_RX_PCIE(obj) OBJECT_CHECK(AmdCsi2RxPcieState, (obj), TYPE_AMD_CSI2_RX_PCIE)
+
+#define XILINX_VENDOR_ID    0x10ee
+#define CSI2_DEVICE_ID      0x9024
+
+#define CSI2_MMIO_SIZE      0x2000
+#define CSI2_MSIX_VECTORS   4
+
+/* Standard Register Offsets */
+#define CSI2_CORE_CONFIG_REG            0x00
+#define CSI2_INT_STATUS_REG             0x24
+#define CSI2_INT_ENABLE_REG             0x28
+#define CSI2_GLOBAL_INT_EN_REG          0x20
+#define CSI2_CORE_STATUS_REG            0x10
+
+#define CSI2_CORE_CONFIG_CORE_EN_MASK   (1U << 0)
+#define CSI2_INT_STATUS_FRAME_RECEIVED  (1U << 31)
+
+/* --- NEW: DMA Queue Registers --- */
+#define CSI2_DMA_QUEUE_DATA_LOW_REG     0x100 // WO
+#define CSI2_DMA_QUEUE_DATA_HIGH_REG    0x104 // WO
+#define CSI2_DMA_QUEUE_STATUS_REG       0x108 // RO
+
+/* DMA Queue Status bits */
+#define DMA_QUEUE_FULL_MASK             (1U << 15)
+#define DMA_QUEUE_ENTRIES_SHIFT         8
+#define DMA_QUEUE_ENTRIES_MASK          (0x1F << DMA_QUEUE_ENTRIES_SHIFT) // 5 bits for 0-31
+#define DMA_QUEUE_DEPTH_MASK            (0x1F) // 5 bits for 0-31
+
+#define DMA_QUEUE_CAPACITY              16
+
+#define FRAME_TIMER_INTERVAL_MS         33
+#define FRAME_WIDTH                     1920
+#define FRAME_HEIGHT                    1080
+#define FRAME_BPP                       2 // YUYV
+#define FRAME_SIZE                      (FRAME_WIDTH * FRAME_HEIGHT * FRAME_BPP)
+
+typedef struct DmaRequest {
+    uint64_t addr;
+    QTAILQ_ENTRY(DmaRequest) next;
+} DmaRequest;
+
+typedef struct AmdCsi2RxPcieState {
+    PCIDevice parent_obj;
+    MemoryRegion mmio;
+    uint32_t regs[CSI2_MMIO_SIZE / 4];
+    QEMUTimer *frame_timer;
+    uint32_t frame_count;
+    bool streaming;
+    uint8_t *dma_buf;
+    uint64_t dma_addr_tmp; // For 64-bit write assembly
+
+    QTAILQ_HEAD(DmaQueue, DmaRequest) dma_queue;
+    uint32_t dma_queue_len;
+
+    QEMUBH *irq_bh;  // 추가: Bottom Half
+} AmdCsi2RxPcieState;
+
+static void csi2_update_interrupt(AmdCsi2RxPcieState *s)
+{
+    PCIDevice *pci_dev = PCI_DEVICE(s);
+    bool should_interrupt = (s->regs[CSI2_GLOBAL_INT_EN_REG / 4] & 1) &&
+                            (s->regs[CSI2_INT_STATUS_REG / 4] & s->regs[CSI2_INT_ENABLE_REG / 4]);
+
+    qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: should_interrupt=%d, global_en=%x, status=%x, enable=%x\n",
+                  should_interrupt,
+                  s->regs[CSI2_GLOBAL_INT_EN_REG / 4],
+                  s->regs[CSI2_INT_STATUS_REG / 4],
+                  s->regs[CSI2_INT_ENABLE_REG / 4]);
+#if 0
+    if (should_interrupt) {
+	if (msix_enabled(pci_dev)) {
+            msix_notify(pci_dev, 0);
+            qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: MSI-X notify sent\n");
+	    /* 짧은 지연 후 다시 체크 */
+            qemu_bh_schedule(s->irq_bh);
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: MSI-X not enabled!\n");
+        }
+    } else {
+	    /* 인터럽트 조건이 해제되면 명시적으로 클리어 */
+        if (msix_enabled(pci_dev)) {
+            /* MSI-X는 edge-triggered이므로 별도 처리 불필요 */
+        }
+    }
+#else
+    if (should_interrupt) {
+        if (msix_enabled(pci_dev)) {
+            msix_notify(pci_dev, 0);
+            qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: MSI-X notify sent\n");
+        } else if (msi_enabled(pci_dev)) {
+            msi_notify(pci_dev, 0);
+            qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: MSI notify sent\n");
+        } else {
+            pci_set_irq(pci_dev, 1);
+            qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: Legacy IRQ raised\n");
+        }
+    } else {
+        /* Legacy IRQ의 경우만 클리어 필요 */
+        if (!msix_enabled(pci_dev) && !msi_enabled(pci_dev)) {
+            pci_set_irq(pci_dev, 0);
+        }
+    }
+#endif
+}
+#if 0
+/* Bottom Half 추가 */
+static void csi2_irq_bh(void *opaque)
+{
+    AmdCsi2RxPcieState *s = (AmdCsi2RxPcieState *)opaque;
+    /* 인터럽트 상태 재확인 */
+    csi2_update_interrupt(s);
+}
+#endif
+static uint64_t csi2_mmio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    AmdCsi2RxPcieState *s = AMD_CSI2_RX_PCIE(opaque);
+    
+    if (addr >= CSI2_MMIO_SIZE) return 0;
+    
+    switch (addr) {
+    case CSI2_CORE_STATUS_REG:
+        return (s->frame_count << 16) | (s->streaming ? 0 : 1);
+    case CSI2_DMA_QUEUE_STATUS_REG:
+        {
+            uint32_t status = DMA_QUEUE_CAPACITY & DMA_QUEUE_DEPTH_MASK;
+            status |= (s->dma_queue_len << DMA_QUEUE_ENTRIES_SHIFT) & DMA_QUEUE_ENTRIES_MASK;
+            if (s->dma_queue_len >= DMA_QUEUE_CAPACITY) {
+                status |= DMA_QUEUE_FULL_MASK;
+            }
+            return status;
+        }
+    default:
+        return s->regs[addr / 4];
+    }
+}
+
+static void csi2_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    AmdCsi2RxPcieState *s = AMD_CSI2_RX_PCIE(opaque);
+    
+    if (addr >= CSI2_MMIO_SIZE) return;
+
+    switch (addr) {
+    case CSI2_CORE_CONFIG_REG:
+        s->regs[addr / 4] = val;
+        bool core_enabled = val & CSI2_CORE_CONFIG_CORE_EN_MASK;
+        if (core_enabled && !s->streaming) {
+            s->streaming = true;
+            s->frame_count = 0;
+            timer_mod(s->frame_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + FRAME_TIMER_INTERVAL_MS);
+        } else if (!core_enabled && s->streaming) {
+            s->streaming = false;
+            timer_del(s->frame_timer);
+        }
+        break;
+    case CSI2_INT_STATUS_REG:
+#if 0
+        if (val & CSI2_INT_STATUS_FRAME_RECEIVED) {
+            s->regs[addr / 4] &= ~CSI2_INT_STATUS_FRAME_RECEIVED;
+        }
+#else
+	/* W1C (Write 1 to Clear) */
+	if (val & CSI2_INT_STATUS_FRAME_RECEIVED) {
+		s->regs[addr / 4] &= ~CSI2_INT_STATUS_FRAME_RECEIVED;
+		/* 인터럽트 상태 업데이트 */
+		csi2_update_interrupt(s);
+    	}
+#endif
+        break;
+    case CSI2_DMA_QUEUE_DATA_LOW_REG:
+        s->dma_addr_tmp = (s->dma_addr_tmp & 0xFFFFFFFF00000000) | (uint32_t)val;
+        break;
+    case CSI2_DMA_QUEUE_DATA_HIGH_REG:
+        s->dma_addr_tmp = (s->dma_addr_tmp & 0x00000000FFFFFFFF) | (val << 32);
+        if (s->dma_queue_len < DMA_QUEUE_CAPACITY) {
+            DmaRequest *req = g_new(DmaRequest, 1);
+            req->addr = s->dma_addr_tmp;
+            QTAILQ_INSERT_TAIL(&s->dma_queue, req, next);
+            s->dma_queue_len++;
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie-sink: DMA queue full! Request ignored.\n");
+        }
+        break;
+    default:
+        s->regs[addr / 4] = val;
+        break;
+    }
+}
+
+static const MemoryRegionOps csi2_mmio_ops = {
+    .read = csi2_mmio_read, .write = csi2_mmio_write, .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4, .valid.max_access_size = 4,
+};
+
+static void csi2_frame_timer_cb(void *opaque)
+#if 0
+{
+    AmdCsi2RxPcieState *s = AMD_CSI2_RX_PCIE(opaque);
+
+    qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: Timer callback, streaming=%d, queue_len=%d\n",
+                  s->streaming, s->dma_queue_len);
+
+    if (!s->streaming) return;
+
+    if (!QTAILQ_EMPTY(&s->dma_queue)) {
+        DmaRequest *req = QTAILQ_FIRST(&s->dma_queue);
+        QTAILQ_REMOVE(&s->dma_queue, req, next);
+        s->dma_queue_len--;
+
+	qemu_log_mask(LOG_GUEST_ERROR,
+                     "csi2-pcie: DMA write to 0x%lx, size=%d\n",
+                     req->addr, FRAME_SIZE);
+
+        memset(s->dma_buf, s->frame_count % 256, FRAME_SIZE);
+        if(pci_dma_write(PCI_DEVICE(s), req->addr, s->dma_buf, FRAME_SIZE)!=0){
+		qemu_log_mask(LOG_GUEST_ERROR, 
+                         "csi2-pcie: DMA write failed!\n");		
+	}
+        g_free(req);
+        
+        s->frame_count++;
+        s->regs[CSI2_INT_STATUS_REG / 4] |= CSI2_INT_STATUS_FRAME_RECEIVED;
+
+	qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: Triggering MSI-X vector 0\n");
+        csi2_update_interrupt(s);
+    }
+
+    timer_mod(s->frame_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + FRAME_TIMER_INTERVAL_MS);
+}
+#else
+{
+    AmdCsi2RxPcieState *s = AMD_CSI2_RX_PCIE(opaque);
+
+    if (!s->streaming) return;
+
+    if (!QTAILQ_EMPTY(&s->dma_queue)) {
+        DmaRequest *req = QTAILQ_FIRST(&s->dma_queue);
+        QTAILQ_REMOVE(&s->dma_queue, req, next);
+        s->dma_queue_len--;
+
+        qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: DMA write to 0x%lx, size=%d\n", 
+                      req->addr, FRAME_SIZE);
+
+        memset(s->dma_buf, s->frame_count % 256, FRAME_SIZE);
+        if (pci_dma_write(PCI_DEVICE(s), req->addr, s->dma_buf, FRAME_SIZE) != 0) {
+            qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: DMA write failed!\n");
+        }
+        g_free(req);
+        
+        s->frame_count++;
+        
+        /* 인터럽트 상태 설정 전에 이전 상태 확인 */
+        if (s->regs[CSI2_INT_STATUS_REG / 4] & CSI2_INT_STATUS_FRAME_RECEIVED) {
+            qemu_log_mask(LOG_GUEST_ERROR, 
+                         "csi2-pcie: Warning: Previous interrupt not cleared!\n");
+        }
+        
+        s->regs[CSI2_INT_STATUS_REG / 4] |= CSI2_INT_STATUS_FRAME_RECEIVED;
+        
+        qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: Triggering interrupt\n");
+        csi2_update_interrupt(s);
+    }
+
+    timer_mod(s->frame_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + FRAME_TIMER_INTERVAL_MS);
+}
+#endif
+
+static void csi2_clear_dma_queue(AmdCsi2RxPcieState *s)
+{
+    DmaRequest *req, *tmp;
+    QTAILQ_FOREACH_SAFE(req, &s->dma_queue, next, tmp) {
+        QTAILQ_REMOVE(&s->dma_queue, req, next);
+        g_free(req);
+    }
+    s->dma_queue_len = 0;
+}
+
+static void amd_csi2_rx_pcie_reset(Object *obj, ResetType type)
+{
+    AmdCsi2RxPcieState *s = AMD_CSI2_RX_PCIE(obj);
+    timer_del(s->frame_timer);
+    memset(s->regs, 0, sizeof(s->regs));
+    s->frame_count = 0;
+    s->streaming = false;
+    csi2_clear_dma_queue(s);
+}
+
+static void amd_csi2_rx_pcie_realize(PCIDevice *pci_dev, Error **errp)
+#if 0
+{
+    AmdCsi2RxPcieState *s = AMD_CSI2_RX_PCIE(pci_dev);
+    int ret;
+    
+    s->dma_buf = g_new0(uint8_t, FRAME_SIZE);
+    QTAILQ_INIT(&s->dma_queue);
+    s->dma_queue_len = 0;
+
+    pci_config_set_interrupt_pin(pci_dev->config, 1);
+    memory_region_init_io(&s->mmio, OBJECT(s), &csi2_mmio_ops, s, "csi2-mmio", CSI2_MMIO_SIZE);
+    pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
+
+    ret = msix_init_exclusive_bar(pci_dev, CSI2_MSIX_VECTORS, 1, errp);
+    if(ret) {
+	error_report("MSI-X init failed: %d", ret);
+        g_free(s->dma_buf);
+        return;
+    }
+
+    // MSI-X 벡터 설정 확인
+    for (int i = 0; i < CSI2_MSIX_VECTORS; i++) {
+        msix_vector_use(pci_dev, i);
+        qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: MSI-X vector %d enabled\n", i);
+    }
+
+    // MSI-X 상태 확인
+    qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: MSI-X initialized with %d vectors\n",
+                  CSI2_MSIX_VECTORS);
+
+    s->frame_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, csi2_frame_timer_cb, s);
+}
+#else
+{
+    AmdCsi2RxPcieState *s = AMD_CSI2_RX_PCIE(pci_dev);
+    int msix_ret;
+    
+    s->dma_buf = g_new0(uint8_t, FRAME_SIZE);
+    QTAILQ_INIT(&s->dma_queue);
+    s->dma_queue_len = 0;
+
+    pci_config_set_interrupt_pin(pci_dev->config, 1);
+    memory_region_init_io(&s->mmio, OBJECT(s), &csi2_mmio_ops, s, "csi2-mmio", CSI2_MMIO_SIZE);
+    pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
+
+    /* MSI-X 초기화 시도 */
+    msix_ret = msix_init_exclusive_bar(pci_dev, CSI2_MSIX_VECTORS, 1, errp);
+    if (msix_ret) {
+        qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: MSI-X init failed: %d\n", msix_ret);
+        /* MSI-X 실패해도 계속 진행 (Legacy 또는 MSI 사용) */
+    } else {
+        /* MSI-X 벡터 활성화 */
+        for (int i = 0; i < CSI2_MSIX_VECTORS; i++) {
+            msix_vector_use(pci_dev, i);
+        }
+        qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: MSI-X initialized with %d vectors\n", 
+                      CSI2_MSIX_VECTORS);
+    }
+    
+    /* MSI 초기화도 시도 */
+    if (msi_init(pci_dev, 0x50, 1, true, false, errp) == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR, "csi2-pcie: MSI initialized\n");
+    }
+    
+    s->frame_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, csi2_frame_timer_cb, s);
+}
+#endif
+
+static void amd_csi2_rx_pcie_exit(PCIDevice *pci_dev)
+{
+    AmdCsi2RxPcieState *s = AMD_CSI2_RX_PCIE(pci_dev);
+    timer_free(s->frame_timer);
+    csi2_clear_dma_queue(s);
+    g_free(s->dma_buf);
+}
+
+static const VMStateDescription vmstate_amd_csi2_rx_pcie = {
+    .name = TYPE_AMD_CSI2_RX_PCIE, .version_id = 7, .minimum_version_id = 7,
+    .fields = (VMStateField[]) {
+        VMSTATE_PCI_DEVICE(parent_obj, AmdCsi2RxPcieState),
+        VMSTATE_UINT32_ARRAY(regs, AmdCsi2RxPcieState, CSI2_MMIO_SIZE / 4),
+        VMSTATE_UINT32(frame_count, AmdCsi2RxPcieState),
+        VMSTATE_BOOL(streaming, AmdCsi2RxPcieState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void amd_csi2_rx_pcie_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *pc = PCI_DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
+    pc->realize = amd_csi2_rx_pcie_realize;
+    pc->exit = amd_csi2_rx_pcie_exit;
+    pc->vendor_id = XILINX_VENDOR_ID;
+    pc->device_id = CSI2_DEVICE_ID;
+    pc->class_id = PCI_CLASS_MULTIMEDIA_OTHER;
+    rc->phases.hold = amd_csi2_rx_pcie_reset;
+    dc->vmsd = &vmstate_amd_csi2_rx_pcie;
+    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+}
+
+static const TypeInfo amd_csi2_rx_pcie_info = {
+    .name = TYPE_AMD_CSI2_RX_PCIE, .parent = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(AmdCsi2RxPcieState), .class_init = amd_csi2_rx_pcie_class_init,
+    .interfaces = (InterfaceInfo[]) { { INTERFACE_CONVENTIONAL_PCI_DEVICE }, { } },
+};
+
+static void amd_csi2_rx_pcie_register_types(void)
+{
+    type_register_static(&amd_csi2_rx_pcie_info);
+}
+type_init(amd_csi2_rx_pcie_register_types);
