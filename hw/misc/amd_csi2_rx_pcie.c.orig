@@ -56,7 +56,7 @@
 
 #define DMA_QUEUE_CAPACITY              16
 
-#define FRAME_TIMER_INTERVAL_MS         33
+#define DEFAULT_FRAME_INTERVAL_MS       33
 #define FRAME_WIDTH                     1920
 #define FRAME_HEIGHT                    1080
 #define FRAME_BPP                       2
@@ -102,6 +102,7 @@ typedef struct AmdCsi2RxPcieState {
     uint32_t format;
     uint32_t fps;
     uint32_t frame_size;
+    uint32_t frame_interval_ms;
 } AmdCsi2RxPcieState;
 
 static void csi2_update_format(AmdCsi2RxPcieState *s)
@@ -134,6 +135,7 @@ static void csi2_update_format(AmdCsi2RxPcieState *s)
         s->width = FRAME_WIDTH;
         s->height = FRAME_HEIGHT;
     }
+    if (s->fps == 0) s->fps = 30;
     
     /* 포맷에 따른 BPP 계산 */
     int bpp;
@@ -154,6 +156,9 @@ static void csi2_update_format(AmdCsi2RxPcieState *s)
     /* DMA 버퍼 재할당 */
     g_free(s->dma_buf);
     s->dma_buf = g_new0(uint8_t, s->frame_size);
+    
+    /* 프레임 인터벌 계산 */
+    s->frame_interval_ms = (s->fps > 0) ? (1000 / s->fps) : DEFAULT_FRAME_INTERVAL_MS;
 }
 #endif
 
@@ -283,11 +288,13 @@ static void csi2_frame_timer_cb(void *opaque)
         QTAILQ_REMOVE(&s->dma_queue, req, next);
         s->dma_queue_len--;
 
-        /* Generate frame data with pattern */
-        memset(s->dma_buf, s->frame_count % 256, FRAME_SIZE);
+        /* Use pre-initialized buffer, only update frame counter */
+        /* Buffer is already filled with Y=16, U/V=128 (valid black frame) */
+        uint32_t *counter = (uint32_t *)s->dma_buf;
+        *counter = s->frame_count; /* First 4 bytes as frame counter */
         
         /* Write frame to guest memory */
-        if(pci_dma_write(PCI_DEVICE(s), req->addr, s->dma_buf, FRAME_SIZE) != 0){
+        if(pci_dma_write(PCI_DEVICE(s), req->addr, s->dma_buf, s->frame_size) != 0){
 		s->regs[CSI2_ERROR_STATUS_REG / 4] |= CSI2_ERROR_DMA_FAILED;
 		csi2_update_interrupt(s, CSI2_IRQ_DMA_ERROR);
 	}
@@ -300,7 +307,7 @@ static void csi2_frame_timer_cb(void *opaque)
         csi2_update_interrupt(s, CSI2_IRQ_FRAME_DONE);
     }
 
-    timer_mod(s->frame_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + FRAME_TIMER_INTERVAL_MS);
+    timer_mod(s->frame_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + s->frame_interval_ms);
 }
 
 static void csi2_clear_dma_queue(AmdCsi2RxPcieState *s)
@@ -327,7 +334,16 @@ static void amd_csi2_rx_pcie_realize(PCIDevice *pci_dev, Error **errp)
 {
     AmdCsi2RxPcieState *s = AMD_CSI2_RX_PCIE(pci_dev);
     
+    s->width = FRAME_WIDTH;
+    s->height = FRAME_HEIGHT;
+    s->format = V4L2_PIX_FMT_YUYV;
+    s->frame_size = FRAME_SIZE;
+    s->frame_interval_ms = DEFAULT_FRAME_INTERVAL_MS;
     s->dma_buf = g_new0(uint8_t, FRAME_SIZE);
+    /* Initialize once with valid YUV black frame */
+    for (int i = 1; i < FRAME_SIZE; i += 2) {
+        s->dma_buf[i] = 128; /* U/V channels */
+    }
     QTAILQ_INIT(&s->dma_queue);
     s->dma_queue_len = 0;
 

@@ -1,0 +1,17 @@
+--- amd_csi2_rx_pcie.c
++++ amd_csi2_rx_pcie.c
+@@ -208,13 +203,11 @@ static void csi2_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned s
+         if (core_enabled && !s->streaming) {
+             s->streaming = true;
+             s->frame_count = 0;
+-            csi2_update_format(s);
+-            timer_mod(s->frame_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + s->frame_interval_ms);
++            timer_mod(s->frame_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + FRAME_TIMER_INTERVAL_MS);
+         } else if (!core_enabled && s->streaming) {
+             s->streaming = false;
+             timer_del(s->frame_timer);
+         }
+-        break;
+         
+     case CSI2_INT_STATUS_REG:
+         /* W1C (Write 1 to Clear) */
