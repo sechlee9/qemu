@@ -1,6 +1,6 @@
 /*
  * AMD CSI-2 RX PCIe Device for QEMU with Ring Buffer
- * Version: 2.0 - Complete rewrite with ring buffer architecture
+ * Version: 2.2 - Timer performance improvements
  */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
@@ -25,10 +25,10 @@
 
 #define CSI2_MMIO_SIZE      0x2000
 #define CSI2_MSIX_VECTORS   4
-#define CSI2_RING_SIZE      16
+#define CSI2_RING_SIZE      32
 
 /* Debug macro */
-#define CSI2_DEBUG 1
+//#define CSI2_DEBUG 
 
 #ifdef CSI2_DEBUG
 #define CSI2_DPRINTF(fmt, ...) \
@@ -65,6 +65,9 @@
 #define CSI2_DEBUG_REG                  0x300
 #define CSI2_ERROR_COUNT_REG            0x304
 #define CSI2_FRAME_COUNT_REG            0x308
+#define CSI2_TIMER_STATS_REG            0x310
+#define CSI2_TIMER_DRIFT_REG            0x314
+#define CSI2_TIMER_CONFIG_REG           0x318  /* Timer configuration register */
 
 /* Control bits */
 #define CSI2_CORE_CONFIG_ENABLE         (1U << 0)
@@ -84,6 +87,15 @@
 #define CSI2_INT_FRAME_DONE             (1U << 0)
 #define CSI2_INT_RING_FULL              (1U << 1)
 #define CSI2_INT_ERROR                  (1U << 2)
+
+/* Test pattern types */
+typedef enum {
+    PATTERN_COLOR_BARS = 0,
+    PATTERN_GRADIENT,
+    PATTERN_MOVING_BARS,
+    PATTERN_SOLID_COLOR,
+    PATTERN_CHECKERBOARD
+} TestPattern;
 
 /* Ring buffer entry structure */
 typedef struct RingEntry {
@@ -140,7 +152,26 @@ typedef struct AmdCsi2RxPcieState {
     uint32_t int_status;
     uint32_t int_enable;
     uint32_t global_int_en;
+    
+    /* Test pattern */
+    TestPattern pattern;
+    uint32_t pattern_offset;
+    
+    /* Performance tuning */
+    bool batch_interrupts;
+    uint32_t frames_since_interrupt;
+    int64_t last_interrupt_time;
+    
+    /* Timer improvements */
+    int64_t next_frame_time;
+    int64_t frame_period_ns;
+    bool use_realtime_clock;
+    uint32_t timer_slack_ns;  /* Changed from int to uint32_t */
+    int64_t stream_start_time;
 } AmdCsi2RxPcieState;
+
+/* Static buffer for frame generation */
+static uint8_t *frame_generation_buffer = NULL;
 
 /* Helper functions */
 static void csi2_update_irq(AmdCsi2RxPcieState *s)
@@ -184,7 +215,7 @@ static int csi2_ring_is_empty(uint32_t head, uint32_t tail)
 {
     return head == tail;
 }
-#if 0
+
 static int csi2_ring_count(uint32_t head, uint32_t tail, uint32_t size)
 {
     if (head >= tail) {
@@ -193,7 +224,7 @@ static int csi2_ring_count(uint32_t head, uint32_t tail, uint32_t size)
         return size - tail + head;
     }
 }
-#endif
+
 static void csi2_update_ring_status(AmdCsi2RxPcieState *s)
 {
     uint32_t status = 0;
@@ -209,32 +240,35 @@ static void csi2_update_ring_status(AmdCsi2RxPcieState *s)
     if (csi2_ring_is_empty(s->ring_head, s->ring_tail)) {
         status |= RING_STATUS_EMPTY;
     }
-    
-    /* Write status - no need to store in regs array */
 }
 
 static int csi2_read_ring_head(AmdCsi2RxPcieState *s)
 {
     PCIDevice *pci_dev = PCI_DEVICE(s);
     uint32_t head;
-    
+    uint32_t old_head = s->ring_head;
+
     if (!s->ring_base_addr) {
         return -1;
     }
-    
+
     /* Read head from ring buffer in guest memory */
     if (pci_dma_read(pci_dev, s->ring_base_addr + offsetof(RingBuffer, head),
                      &head, sizeof(head)) != 0) {
         CSI2_DPRINTF("Failed to read ring head");
         return -1;
     }
-    
+
     head = le32_to_cpu(head);
     if (head >= s->ring_size) {
         CSI2_DPRINTF("Invalid ring head: %u (size=%u)", head, s->ring_size);
         return -1;
     }
-    
+
+    if (old_head != head) {
+        CSI2_DPRINTF("Ring head updated: %u -> %u", old_head, head);
+    }
+
     s->ring_head = head;
     return 0;
 }
@@ -260,19 +294,142 @@ static int csi2_write_ring_tail(AmdCsi2RxPcieState *s)
     return 0;
 }
 
-static void generate_test_frame(void *buffer, uint32_t size, uint32_t frame_num)
+/* Generate color bars pattern */
+static void generate_color_bars(uint8_t *buffer, uint32_t width, uint32_t height)
 {
-    uint32_t *data = (uint32_t *)buffer;
-    uint32_t pixels = size / 4;
-    uint32_t pattern = 0x80FF80FF;  /* Simple test pattern */
+    static const uint32_t colors[] = {
+        0xFF0080FF,  /* White */
+        0xE10080E1,  /* Yellow */
+        0xB200B2B2,  /* Cyan */
+        0x950095A0,  /* Green */
+        0x69006969,  /* Magenta */
+        0x4C004C5A,  /* Red */
+        0x1D001D3F,  /* Blue */
+        0x00800080   /* Black */
+    };
     
-    /* First word is frame number */
-    data[0] = cpu_to_le32(frame_num);
+    uint32_t bar_width = width / 8;
+    uint16_t *data = (uint16_t *)buffer;
     
-    /* Fill with test pattern */
-    for (uint32_t i = 1; i < pixels; i++) {
-        data[i] = cpu_to_le32(pattern);
-        pattern = (pattern << 1) | (pattern >> 31);  /* Rotate */
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            uint32_t bar = x / bar_width;
+            if (bar >= 8) bar = 7;
+            
+            uint32_t color = colors[bar];
+            uint8_t y_val = (color >> 16) & 0xFF;
+            uint8_t u_val = (color >> 8) & 0xFF;
+            uint8_t v_val = color & 0xFF;
+            
+            /* YUYV format */
+            if (x & 1) {
+                *data++ = (v_val << 8) | y_val;
+            } else {
+                *data++ = (u_val << 8) | y_val;
+            }
+        }
+    }
+}
+
+/* Generate gradient pattern */
+static void generate_gradient(uint8_t *buffer, uint32_t width, uint32_t height, uint32_t offset)
+{
+    uint16_t *data = (uint16_t *)buffer;
+    
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            uint8_t y_val = ((x + offset) * 255 / width) & 0xFF;
+            uint8_t u_val = (y * 255 / height) & 0xFF;
+            uint8_t v_val = 128;
+            
+            /* YUYV format */
+            if (x & 1) {
+                *data++ = (v_val << 8) | y_val;
+            } else {
+                *data++ = (u_val << 8) | y_val;
+            }
+        }
+    }
+}
+
+/* Generate moving bars pattern */
+static void generate_moving_bars(uint8_t *buffer, uint32_t width, uint32_t height, uint32_t offset)
+{
+    uint16_t *data = (uint16_t *)buffer;
+    uint32_t bar_width = 64;
+    uint32_t shifted_offset = offset % (bar_width * 2);
+    
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            uint32_t pos = (x + shifted_offset) % (bar_width * 2);
+            uint8_t y_val = (pos < bar_width) ? 235 : 16;
+            uint8_t u_val = 128;
+            uint8_t v_val = 128;
+            
+            /* YUYV format */
+            if (x & 1) {
+                *data++ = (v_val << 8) | y_val;
+            } else {
+                *data++ = (u_val << 8) | y_val;
+            }
+        }
+    }
+}
+
+/* Generate frame with frame number overlay */
+static void generate_test_frame(void *buffer, uint32_t size, uint32_t frame_num, AmdCsi2RxPcieState *s)
+{
+    /* Generate base pattern */
+    switch (s->pattern) {
+    case PATTERN_COLOR_BARS:
+        generate_color_bars(buffer, s->width, s->height);
+        break;
+    case PATTERN_GRADIENT:
+        generate_gradient(buffer, s->width, s->height, s->pattern_offset);
+        break;
+    case PATTERN_MOVING_BARS:
+        generate_moving_bars(buffer, s->width, s->height, s->pattern_offset);
+        break;
+    default:
+        /* Solid gray */
+        memset(buffer, 0x80, size);
+        break;
+    }
+    
+    /* Update pattern offset for animation */
+    s->pattern_offset += 4;
+    
+    /* Overlay frame number in top-left corner */
+    uint16_t *data = (uint16_t *)buffer;
+    uint32_t digits[8];
+    int num_digits = 0;
+    uint32_t temp = frame_num;
+    
+    /* Extract digits */
+    do {
+        digits[num_digits++] = temp % 10;
+        temp /= 10;
+    } while (temp > 0 && num_digits < 8);
+    
+    /* Draw digits */
+    for (int i = 0; i < num_digits && i < 8; i++) {
+        int digit = digits[num_digits - 1 - i];
+        int x_start = 10 + i * 12;
+        int y_start = 10;
+        
+        /* Simple digit rendering (3x5 font) */
+        for (int y = 0; y < 5; y++) {
+            for (int x = 0; x < 3; x++) {
+                int px = x_start + x * 2;
+                int py = y_start + y * 2;
+                if (px < s->width && py < s->height) {
+                    int offset = py * s->width + px;
+                    uint8_t val = (digit == 0 || digit == 8) ? 235 : 
+                                 ((x == 1 || y == 2) ? 235 : 16);
+                    data[offset] = (128 << 8) | val;
+                }
+            }
+        }
     }
 }
 
@@ -280,13 +437,21 @@ static void csi2_process_frame(AmdCsi2RxPcieState *s)
 {
     PCIDevice *pci_dev = PCI_DEVICE(s);
     RingEntry entry;
-    void *buffer;
-    dma_addr_t len;
+    int64_t start_time, end_time;
+    
+    start_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    
+    /* Read current ring head from guest memory */
+    if (csi2_read_ring_head(s) < 0) {
+        s->error_count++;
+        return;
+    }
     
     /* Check if we have a buffer available */
     if (csi2_ring_is_empty(s->ring_head, s->ring_tail)) {
         s->dropped_frames++;
-        CSI2_DPRINTF("No buffer available, frame dropped");
+        CSI2_DPRINTF("No buffer available, frame dropped (head=%u, tail=%u)", 
+                     s->ring_head, s->ring_tail);
         return;
     }
     
@@ -305,8 +470,9 @@ static void csi2_process_frame(AmdCsi2RxPcieState *s)
     entry.dma_addr = le64_to_cpu(entry.dma_addr);
     entry.size = le32_to_cpu(entry.size);
     
-    CSI2_DPRINTF("Processing frame %u: buffer at 0x%lx, size=%u", 
-                 s->frame_count, entry.dma_addr, entry.size);
+    CSI2_DPRINTF("Processing frame %u: buffer at 0x%lx, size=%u (head=%u, tail=%u)", 
+                 s->frame_count, entry.dma_addr, entry.size, 
+                 s->ring_head, s->ring_tail);
     
     /* Validate entry */
     if (entry.size != s->frame_size) {
@@ -316,24 +482,20 @@ static void csi2_process_frame(AmdCsi2RxPcieState *s)
         return;
     }
     
-    /* Map buffer for DMA */
-    len = entry.size;
-    buffer = pci_dma_map(pci_dev, entry.dma_addr, &len, DMA_DIRECTION_FROM_DEVICE);
-    
-    if (!buffer || len != entry.size) {
-        CSI2_DPRINTF("Failed to map buffer");
-        s->error_count++;
-        if (buffer) {
-            pci_dma_unmap(pci_dev, buffer, len, DMA_DIRECTION_FROM_DEVICE, 0);
-        }
-        return;
+    /* Allocate frame buffer if needed */
+    if (!frame_generation_buffer) {
+        frame_generation_buffer = g_malloc(4096 * 2160 * 2); /* Max 4K resolution */
     }
     
     /* Generate frame data */
-    generate_test_frame(buffer, entry.size, s->frame_count);
+    generate_test_frame(frame_generation_buffer, entry.size, s->frame_count, s);
     
-    /* Unmap buffer */
-    pci_dma_unmap(pci_dev, buffer, len, DMA_DIRECTION_FROM_DEVICE, entry.size);
+    /* Write frame data to guest memory */
+    if (pci_dma_write(pci_dev, entry.dma_addr, frame_generation_buffer, entry.size) != 0) {
+        CSI2_DPRINTF("Failed to write frame data");
+        s->error_count++;
+        return;
+    }
     
     /* Update entry with completion info */
     entry.flags = cpu_to_le32(1);  /* Mark as complete */
@@ -353,25 +515,56 @@ static void csi2_process_frame(AmdCsi2RxPcieState *s)
         return;
     }
     
-    /* Trigger interrupt */
-    csi2_set_interrupt(s, CSI2_INT_FRAME_DONE);
+    CSI2_DPRINTF("Updating tail register to %u", s->ring_tail);
     
     s->frame_count++;
+    s->frames_since_interrupt++;
+    
+    /* Batch interrupts for better performance */
+    if (s->batch_interrupts) {
+        /* Trigger interrupt every 4 frames or if ring is getting full */
+        int ring_occupancy = csi2_ring_count(s->ring_head, s->ring_tail, s->ring_size);
+        if (s->frames_since_interrupt >= 4 || 
+            ring_occupancy >= (s->ring_size * 3 / 4)) {
+            csi2_set_interrupt(s, CSI2_INT_FRAME_DONE);
+            s->frames_since_interrupt = 0;
+        }
+    } else {
+        /* Trigger interrupt for every frame */
+        csi2_set_interrupt(s, CSI2_INT_FRAME_DONE);
+    }
+    
+    end_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    
+    /* Check processing time */
+    if ((end_time - start_time) > s->frame_period_ns / 2) {
+        CSI2_DPRINTF("Frame processing took too long: %ld ms", 
+                     (end_time - start_time) / 1000000);
+    }
+    
     CSI2_DPRINTF("Frame %u completed successfully", s->frame_count - 1);
 }
 
 static void csi2_frame_timer(void *opaque)
 {
     AmdCsi2RxPcieState *s = AMD_CSI2_RX_PCIE(opaque);
+    int64_t now;
     
     if (!s->streaming || !s->ring_enabled) {
         return;
     }
     
+    /* Get current time */
+    if (s->use_realtime_clock) {
+        now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    } else {
+        now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    }
+    
     /* Read current ring head */
     if (csi2_read_ring_head(s) < 0) {
         s->error_count++;
-        return;
+        goto reschedule;
     }
     
     /* Process frame */
@@ -380,11 +573,25 @@ static void csi2_frame_timer(void *opaque)
     /* Update ring status */
     csi2_update_ring_status(s);
     
-    /* Schedule next frame */
+reschedule:
+    /* Schedule next frame with drift correction */
     if (s->streaming) {
-        int64_t interval = 1000000000LL / s->fps;  /* nanoseconds */
-        timer_mod_ns(s->frame_timer, 
-                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + interval);
+        /* Initialize next frame time */
+        if (s->next_frame_time == 0) {
+            s->next_frame_time = now + s->frame_period_ns;
+        } else {
+            /* Increment by fixed period to avoid drift */
+            s->next_frame_time += s->frame_period_ns;
+            
+            /* Re-sync if too far behind */
+            if (s->next_frame_time < now - s->frame_period_ns) {
+                CSI2_DPRINTF("Timer drift detected, resyncing");
+                s->next_frame_time = now + s->frame_period_ns;
+            }
+        }
+        
+        /* Reschedule timer */
+        timer_mod_ns(s->frame_timer, s->next_frame_time);
     }
 }
 
@@ -400,11 +607,26 @@ static void csi2_start_streaming(AmdCsi2RxPcieState *s)
     s->streaming = true;
     s->frame_count = 0;
     s->dropped_frames = 0;
+    s->frames_since_interrupt = 0;
+    s->pattern_offset = 0;
+    s->last_interrupt_time = 0;
+    s->next_frame_time = 0;
+    s->stream_start_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     
-    /* Start frame timer */
-    int64_t interval = 1000000000LL / s->fps;
-    timer_mod_ns(s->frame_timer, 
-                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + interval);
+    /* Calculate frame period */
+    s->frame_period_ns = 1000000000LL / s->fps;
+    
+    /* Enable batch interrupts for better performance */
+    s->batch_interrupts = false;  /* Disabled for accurate timing test */
+    
+    /* Start frame timer immediately */
+    if (s->use_realtime_clock) {
+        timer_mod_ns(s->frame_timer, 
+                     qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+    } else {
+        timer_mod_ns(s->frame_timer, 
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
 }
 
 static void csi2_stop_streaming(AmdCsi2RxPcieState *s)
@@ -417,12 +639,16 @@ static void csi2_stop_streaming(AmdCsi2RxPcieState *s)
     
     s->streaming = false;
     timer_del(s->frame_timer);
+    
+    /* Clear any pending interrupts */
+    s->frames_since_interrupt = 0;
 }
 
 static uint64_t csi2_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
     AmdCsi2RxPcieState *s = AMD_CSI2_RX_PCIE(opaque);
     uint64_t val = 0;
+    int64_t now;
     
     switch (addr) {
     case CSI2_CORE_CONFIG_REG:
@@ -463,6 +689,7 @@ static uint64_t csi2_mmio_read(void *opaque, hwaddr addr, unsigned size)
         
     case CSI2_RING_TAIL_REG:
         val = s->ring_tail;
+        CSI2_DPRINTF("Read ring tail register: %lu", (unsigned long)val);
         break;
         
     case CSI2_RING_STATUS_REG:
@@ -474,6 +701,14 @@ static uint64_t csi2_mmio_read(void *opaque, hwaddr addr, unsigned size)
         if (csi2_ring_is_empty(s->ring_head, s->ring_tail)) {
             val |= RING_STATUS_EMPTY;
         }
+        break;
+        
+    case CSI2_TIMER_CONFIG_REG:
+        /* Timer configuration register */
+        s->use_realtime_clock = (val & 1) ? true : false;
+        s->batch_interrupts = (val & 2) ? true : false;
+        CSI2_DPRINTF("Timer config: realtime=%d, batch_irq=%d",
+                     s->use_realtime_clock, s->batch_interrupts);
         break;
         
     case CSI2_FRAME_COUNT_REG:
@@ -494,6 +729,25 @@ static uint64_t csi2_mmio_read(void *opaque, hwaddr addr, unsigned size)
         
     case CSI2_FPS_REG:
         val = s->fps;
+        break;
+        
+    case CSI2_TIMER_STATS_REG:
+        /* Calculate actual FPS */
+        if (s->frame_count > 0 && s->streaming) {
+            now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            int64_t elapsed = now - s->stream_start_time;
+            if (elapsed > 0) {
+                val = (s->frame_count * 1000000000LL) / elapsed;
+            }
+        }
+        break;
+        
+    case CSI2_TIMER_DRIFT_REG:
+        /* Timer drift in milliseconds */
+        if (s->next_frame_time > 0) {
+            now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            val = (s->next_frame_time - now) / 1000000;
+        }
         break;
         
     default:
@@ -592,6 +846,7 @@ static void csi2_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
     case CSI2_FPS_REG:
         if (val > 0 && val <= 120) {
             s->fps = val;
+            s->frame_period_ns = 1000000000LL / s->fps;
         }
         break;
         
@@ -633,6 +888,13 @@ static void amd_csi2_rx_pcie_reset(Object *obj, ResetType type)
     s->frame_count = 0;
     s->error_count = 0;
     s->dropped_frames = 0;
+    s->pattern = PATTERN_COLOR_BARS;
+    s->pattern_offset = 0;
+    s->batch_interrupts = false;
+    s->frames_since_interrupt = 0;
+    s->last_interrupt_time = 0;
+    s->next_frame_time = 0;
+    s->stream_start_time = 0;
 }
 
 static void amd_csi2_rx_pcie_realize(PCIDevice *pci_dev, Error **errp)
@@ -650,6 +912,10 @@ static void amd_csi2_rx_pcie_realize(PCIDevice *pci_dev, Error **errp)
     s->height = 1080;
     s->fps = 30;
     s->frame_size = s->width * s->height * 2;
+    s->pattern = PATTERN_COLOR_BARS;
+    s->frame_period_ns = 1000000000LL / s->fps;
+    s->use_realtime_clock = false;
+    s->timer_slack_ns = 1000000;  /* 1ms - ensure this is uint32_t */
     
     /* Set up PCI configuration */
     pci_config_set_vendor_id(pci_dev->config, XILINX_VENDOR_ID);
@@ -675,7 +941,8 @@ static void amd_csi2_rx_pcie_realize(PCIDevice *pci_dev, Error **errp)
     }
     
     /* Create frame timer */
-    s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, csi2_frame_timer, s);
+    s->frame_timer = timer_new_ns(s->use_realtime_clock ? QEMU_CLOCK_REALTIME : QEMU_CLOCK_VIRTUAL,
+                                  csi2_frame_timer, s);
     if (!s->frame_timer) {
         error_setg(errp, "Failed to create frame timer");
         msix_uninit_exclusive_bar(pci_dev);
@@ -699,9 +966,25 @@ static void amd_csi2_rx_pcie_exit(PCIDevice *pci_dev)
         timer_free(s->frame_timer);
     }
     
+    /* Free frame buffer */
+    if (frame_generation_buffer) {
+        g_free(frame_generation_buffer);
+        frame_generation_buffer = NULL;
+    }
+    
     /* Clean up MSI-X */
     msix_uninit_exclusive_bar(pci_dev);
 }
+
+/* Properties are causing issues, so we'll use static configuration for now */
+/*
+static Property amd_csi2_rx_pcie_properties[] = {
+    DEFINE_PROP_BOOL("use-realtime", AmdCsi2RxPcieState, use_realtime_clock, false),
+    DEFINE_PROP_UINT32("timer-slack", AmdCsi2RxPcieState, timer_slack_ns, 1000000),
+    DEFINE_PROP_BOOL("batch-irq", AmdCsi2RxPcieState, batch_interrupts, false),
+    {}
+};
+*/
 
 static const VMStateDescription vmstate_amd_csi2_rx_pcie = {
     .name = TYPE_AMD_CSI2_RX_PCIE,
@@ -738,6 +1021,7 @@ static void amd_csi2_rx_pcie_class_init(ObjectClass *klass, const void *data)
     pc->class_id = PCI_CLASS_MULTIMEDIA_OTHER;
     rc->phases.hold = amd_csi2_rx_pcie_reset;
     dc->vmsd = &vmstate_amd_csi2_rx_pcie;
+    /* Properties removed to avoid assertion error */
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
 
