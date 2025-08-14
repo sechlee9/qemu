@@ -1,6 +1,6 @@
 /*
- * AMD CSI-2 RX PCIe V4L2 Driver with Ring Buffer
- * Version: 2.5 - Fixed buffer management for stop_streaming
+ * AMD CSI-2 RX PCIe V4L2 Driver with CXL Memory Support
+ * Version: 3.1 - Fixed CXL integration issues
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -19,9 +19,29 @@
 #include <media/v4l2-ioctl.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-dma-contig.h>
+#include "videobuf2-cxl.h"
+#include "videobuf2-nvme-cmb.h"
 
 #define DRIVER_NAME "amd_csi2_v4l2"
 #define DEVICE_NAME "AMD CSI-2 Camera"
+
+/* Module parameters */
+static bool use_cxl_memory = false;
+module_param(use_cxl_memory, bool, 0644);
+MODULE_PARM_DESC(use_cxl_memory, "Use CXL memory for video buffers (default=true)");
+
+static int debug_level = 3;
+module_param(debug_level, int, 0644);
+MODULE_PARM_DESC(debug_level, "Debug level (0-4)");
+
+static bool use_nvme_cmb = false;
+module_param(use_nvme_cmb, bool, 0644);
+MODULE_PARM_DESC(use_nvme_cmb, "Use NVMe CMB memory for video buffers (default=false)");
+#define csi2_dbg(level, dev, fmt, ...) \
+    do { \
+        if (debug_level >= level) \
+            dev_info(dev, "[CSI2] " fmt, ##__VA_ARGS__); \
+    } while (0)
 
 /* Register Offsets */
 #define CSI2_CORE_CONFIG_REG            0x00
@@ -38,6 +58,13 @@
 #define CSI2_RING_TAIL_REG              0x110
 #define CSI2_RING_CTRL_REG              0x114
 #define CSI2_RING_STATUS_REG            0x118
+
+/* P2P DMA Registers */
+#define CSI2_P2P_CONFIG_REG             0x400
+#define CSI2_P2P_TARGET_LOW             0x404
+#define CSI2_P2P_TARGET_HIGH            0x408
+#define CSI2_P2P_ENABLE_REG             0x40C
+#define CSI2_VERSION_REG                0x410
 
 /* Format Registers */
 #define CSI2_FORMAT_REG                 0x200
@@ -56,21 +83,22 @@
 /* Control bits */
 #define CSI2_CORE_CONFIG_ENABLE         (1U << 0)
 #define CSI2_CORE_CONFIG_RESET          (1U << 1)
-
-/* Ring control bits */
 #define RING_CTRL_ENABLE                (1U << 0)
 #define RING_CTRL_RESET                 (1U << 1)
-
-/* Ring status bits */
 #define RING_STATUS_READY               (1U << 0)
 #define RING_STATUS_FULL                (1U << 1)
 #define RING_STATUS_EMPTY               (1U << 2)
 #define RING_STATUS_ERROR               (1U << 3)
-
-/* Interrupt bits */
 #define CSI2_INT_FRAME_DONE             (1U << 0)
 #define CSI2_INT_RING_FULL              (1U << 1)
 #define CSI2_INT_ERROR                  (1U << 2)
+
+/* P2P control bits */
+#define P2P_CONFIG_ENABLE               (1U << 0)
+#define P2P_CONFIG_CXL_MODE             (1U << 1)
+
+/* Version */
+#define CSI2_VERSION_P2P                0x0300
 
 #define DEFAULT_WIDTH  1920
 #define DEFAULT_HEIGHT 1080
@@ -78,18 +106,7 @@
 #define RING_SIZE      32
 #define MIN_BUFFERS    3
 
-/* Debug levels */
-static int debug_level = 3;
-module_param(debug_level, int, 0644);
-MODULE_PARM_DESC(debug_level, "Debug level (0-4)");
-
-#define csi2_dbg(level, dev, fmt, ...) \
-    do { \
-        if (debug_level >= level) \
-            dev_info(dev, "[CSI2] " fmt, ##__VA_ARGS__); \
-    } while (0)
-
-/* Ring buffer entry structure - must match QEMU */
+/* Ring buffer structures - must match QEMU */
 struct ring_entry {
     u64 dma_addr;
     u32 size;
@@ -98,7 +115,6 @@ struct ring_entry {
     u32 reserved[2];
 } __packed;
 
-/* Ring buffer structure - must match QEMU */
 struct ring_buffer {
     u32 magic;      /* 0x43534932 - "CSI2" */
     u32 version;    /* 0x00020000 - version 2.0 */
@@ -114,24 +130,25 @@ struct amd_csi2_buffer {
     struct vb2_v4l2_buffer vb2_buf;
     struct list_head list;
     u32 index;
-    bool in_ring;  /* Track if buffer is in ring */
+    bool in_ring;
 };
 
 struct amd_csi2_device {
     struct v4l2_device v4l2_dev;
     struct pci_dev *pdev;
     struct video_device *vdev;
-    struct vb2_queue queue;
+    
+    /* Queue context for CXL support */
+    union {
+        struct vb2_queue queue;                    /* Standard queue */
+        struct vb2_cxl_queue_ctx queue_ctx;       /* CXL-enabled queue */
+    };
+    
     struct mutex mutex;
     struct list_head buffer_list;
     
-    /* Lock ordering: ALWAYS acquire in this order:
-     * 1. buffer_lock
-     * 2. ring_lock
-     * Never acquire buffer_lock while holding ring_lock!
-     */
-    spinlock_t buffer_lock;  /* Protects buffer_list */
-    spinlock_t ring_lock;    /* Protects ring buffer and active_buffers */
+    spinlock_t buffer_lock;
+    spinlock_t ring_lock;
     
     void __iomem *mmio_base;
     int irq;
@@ -148,21 +165,33 @@ struct amd_csi2_device {
     unsigned int sequence;
     struct v4l2_pix_format format;
     
+    /* CXL/P2P support */
+    bool cxl_available;
+    bool p2p_enabled;
+    phys_addr_t cxl_base_addr;
+    size_t cxl_size;
+    struct pci_dev *cxl_pdev;
+    struct vb2_cxl_pool *cxl_pool;
+
+    /* NVMe CMB support - 이 부분 추가 */
+    bool use_nvme_cmb;
+    
     /* Statistics */
     u32 queued_buffers;
     u32 completed_buffers;
     u32 dropped_frames;
     u32 errors;
+    u32 cxl_buffers;
+    u32 dram_buffers;
+    u32 nvme_cmb_buffers;
     
-    /* Workqueue for bottom half processing */
+    /* Workqueue */
     struct workqueue_struct *work_queue;
     struct work_struct irq_work;
     
-    /* Performance tuning */
+    /* Timing */
     bool first_frame;
     u32 frame_interval_ns;
-    
-    /* Timing statistics */
     ktime_t last_irq_time;
     ktime_t min_interval;
     ktime_t max_interval;
@@ -177,12 +206,6 @@ struct amd_csi2_device {
     ktime_t total_work_time;
     u32 work_count;
 };
-
-#ifdef CONFIG_LOCKDEP
-/* Define lock classes for lockdep */
-static struct lock_class_key buffer_lock_key;
-static struct lock_class_key ring_lock_key;
-#endif
 
 /* Helper functions */
 static inline u32 csi2_read_reg(struct amd_csi2_device *csi2_dev, u32 offset)
@@ -200,11 +223,6 @@ static int ring_is_full(u32 head, u32 tail, u32 size)
     return ((head + 1) % size) == tail;
 }
 
-static int ring_is_empty(u32 head, u32 tail)
-{
-    return head == tail;
-}
-
 static int ring_count(u32 head, u32 tail, u32 size)
 {
     if (head >= tail)
@@ -213,55 +231,115 @@ static int ring_count(u32 head, u32 tail, u32 size)
         return size - tail + head;
 }
 
-static int ring_free_count(u32 head, u32 tail, u32 size)
+/* Check hardware version */
+static int amd_csi2_check_hw_version(struct amd_csi2_device *csi2_dev)
 {
-    int count = ring_count(head, tail, size);
-    return size - count - 1; /* -1 because we can't fill completely */
+    u32 version = csi2_read_reg(csi2_dev, CSI2_VERSION_REG);
+    
+    csi2_dbg(3, &csi2_dev->pdev->dev, "Hardware version: 0x%04x\n", version);
+    
+    if (version < CSI2_VERSION_P2P) {
+        csi2_dbg(1, &csi2_dev->pdev->dev, 
+                 "Hardware version 0x%04x does not support P2P (need >= 0x%04x)\n",
+                 version, CSI2_VERSION_P2P);
+        return -ENODEV;
+    }
+    
+    return 0;
 }
 
-/* Debug helper - dump all buffer states */
-static void csi2_dump_all_buffer_states(struct amd_csi2_device *csi2_dev, const char *context)
+/* P2P/CXL configuration */
+static int csi2_setup_p2p_for_cxl(struct amd_csi2_device *csi2_dev)
 {
-    struct amd_csi2_buffer *buf;
-    unsigned long flags;
-    int i;
+    struct pci_dev *cxl_pdev;
+    struct pci_dev *upstream_csi2, *upstream_cxl;
+    struct pci_dev *root_csi2, *root_cxl;
     
-    csi2_dbg(2, &csi2_dev->pdev->dev, "=== Buffer State Dump [%s] ===\n", context);
-    
-    /* Pending list */
-    spin_lock_irqsave(&csi2_dev->buffer_lock, flags);
-    list_for_each_entry(buf, &csi2_dev->buffer_list, list) {
-        csi2_dbg(2, &csi2_dev->pdev->dev, 
-                 "  Pending: buf[%d] state=%d\n",
-                 buf->index, buf->vb2_buf.vb2_buf.state);
+    if (!csi2_dev->cxl_available) {
+        csi2_dbg(2, &csi2_dev->pdev->dev, "CXL not available\n");
+        return -ENODEV;
     }
-    spin_unlock_irqrestore(&csi2_dev->buffer_lock, flags);
     
-    /* Ring buffer */
-    spin_lock_irqsave(&csi2_dev->ring_lock, flags);
-    for (i = 0; i < RING_SIZE; i++) {
-        if (csi2_dev->active_buffers[i]) {
-            buf = csi2_dev->active_buffers[i];
-            csi2_dbg(2, &csi2_dev->pdev->dev,
-                     "  Ring[%d]: buf[%d] state=%d in_ring=%d\n",
-                     i, buf->index, buf->vb2_buf.vb2_buf.state,
-                     buf->in_ring);
+    /* CXL PCI 장치 가져오기 */
+    cxl_pdev = csi2_dev->cxl_pdev;
+    if (!cxl_pdev) {
+        /* 백업: 직접 찾기 */
+        cxl_pdev = pci_get_device(0x8086, 0x0d93, NULL);
+        if (!cxl_pdev) {
+            csi2_dbg(1, &csi2_dev->pdev->dev, "CXL PCI device not found\n");
+            return -ENODEV;
         }
+        csi2_dbg(2, &csi2_dev->pdev->dev, "Found CXL device manually: %s\n", 
+                 pci_name(cxl_pdev));
     }
-    spin_unlock_irqrestore(&csi2_dev->ring_lock, flags);
     
-    csi2_dbg(2, &csi2_dev->pdev->dev, "  Head=%u, Tail=%u\n",
-             csi2_dev->ring_head, csi2_dev->ring_tail);
-    csi2_dbg(2, &csi2_dev->pdev->dev, "========================\n");
+    csi2_dbg(2, &csi2_dev->pdev->dev, "Checking P2P between CSI2 %s and CXL %s\n", 
+             pci_name(csi2_dev->pdev), pci_name(cxl_pdev));
+    
+    /* Get upstream bridges */
+    upstream_csi2 = pci_upstream_bridge(csi2_dev->pdev);
+    upstream_cxl = pci_upstream_bridge(cxl_pdev);
+    
+    if (!upstream_csi2 || !upstream_cxl) {
+        csi2_dbg(1, &csi2_dev->pdev->dev, "Missing upstream bridges\n");
+        if (!csi2_dev->cxl_pdev && cxl_pdev)
+            pci_dev_put(cxl_pdev);
+        return -ENODEV;
+    }
+    
+    csi2_dbg(2, &csi2_dev->pdev->dev, 
+             "CSI2 upstream: %s, CXL upstream: %s\n",
+             pci_name(upstream_csi2), pci_name(upstream_cxl));
+    
+    /* lspci 결과에 따르면 둘 다 0e:xx.0 아래에 있으므로 같은 스위치 */
+    if (upstream_csi2->bus == upstream_cxl->bus) {
+        csi2_dbg(2, &csi2_dev->pdev->dev, 
+                 "CSI2 and CXL are under the same switch (bus %02x) - P2P possible\n",
+                 upstream_csi2->bus->number);
+        
+        /* Configure P2P registers */
+        csi2_write_reg(csi2_dev, CSI2_P2P_TARGET_LOW, 
+                       lower_32_bits(csi2_dev->cxl_base_addr));
+        csi2_write_reg(csi2_dev, CSI2_P2P_TARGET_HIGH, 
+                       upper_32_bits(csi2_dev->cxl_base_addr));
+        csi2_write_reg(csi2_dev, CSI2_P2P_CONFIG_REG, 
+                       P2P_CONFIG_ENABLE | P2P_CONFIG_CXL_MODE);
+        
+        csi2_dev->p2p_enabled = true;
+        
+        if (!csi2_dev->cxl_pdev && cxl_pdev)
+            pci_dev_put(cxl_pdev);
+        
+        csi2_dbg(2, &csi2_dev->pdev->dev, "P2P to CXL enabled successfully\n");
+        return 0;
+    }
+    
+    /* 더 상위 레벨 확인 */
+    root_csi2 = pci_upstream_bridge(upstream_csi2);
+    root_cxl = pci_upstream_bridge(upstream_cxl);
+    
+    csi2_dbg(2, &csi2_dev->pdev->dev, 
+             "Root bridges - CSI2: %s, CXL: %s\n",
+             root_csi2 ? pci_name(root_csi2) : "none",
+             root_cxl ? pci_name(root_cxl) : "none");
+    
+    if (!csi2_dev->cxl_pdev && cxl_pdev)
+        pci_dev_put(cxl_pdev);
+    
+    csi2_dbg(1, &csi2_dev->pdev->dev, 
+             "CSI2 and CXL are not under the same switch\n");
+    return -EOPNOTSUPP;
 }
 
-/* Must be called with ring_lock held */
+/* Queue buffer to ring - must be called with ring_lock held */
 static int __csi2_queue_buffer_to_ring_locked(struct amd_csi2_device *csi2_dev,
                                               struct amd_csi2_buffer *buf)
 {
     struct vb2_buffer *vb = &buf->vb2_buf.vb2_buf;
     u32 head = csi2_dev->ring_head;
     u32 hw_tail;
+    dma_addr_t dma_addr;
+    void *cookie;
     
     /* Read the current tail from hardware register */
     hw_tail = csi2_read_reg(csi2_dev, CSI2_RING_TAIL_REG);
@@ -282,9 +360,30 @@ static int __csi2_queue_buffer_to_ring_locked(struct amd_csi2_device *csi2_dev,
         return -ENOSPC;
     }
     
+    /* Get DMA address using generic API */
+    cookie = vb2_plane_cookie(vb, 0);
+    if (!cookie) {
+        csi2_dbg(1, &csi2_dev->pdev->dev, 
+                 "Failed to get DMA cookie for buffer %d\n", buf->index);
+        return -EINVAL;
+    }
+    csi2_dbg(4, &csi2_dev->pdev->dev,
+         "Cookie value: %p, as dma_addr: 0x%llx\n",
+         cookie, (dma_addr_t)(uintptr_t)cookie);
+    if (csi2_dev->cxl_available && use_cxl_memory){
+	    /* cookie is a pointer-encoded DMA address */
+	    dma_addr = (dma_addr_t)(uintptr_t)cookie;
+    } else {
+	    /* 시스템 메모리: vb2_dma_contig_plane_dma_addr 사용 */
+	    dma_addr = vb2_dma_contig_plane_dma_addr(vb, 0);
+	    
+	    csi2_dbg(4, &csi2_dev->pdev->dev,
+             "Real DMA addr: 0x%llx\n", dma_addr);
+    }
+    
     /* Fill ring entry */
-    csi2_dev->ring->entries[head].dma_addr = vb2_dma_contig_plane_dma_addr(vb, 0);
-    csi2_dev->ring->entries[head].size = vb2_plane_size(vb, 0);
+    csi2_dev->ring->entries[head].dma_addr = cpu_to_le64(dma_addr);
+    csi2_dev->ring->entries[head].size = cpu_to_le32(vb2_plane_size(vb, 0));
     csi2_dev->ring->entries[head].flags = 0;
     csi2_dev->ring->entries[head].timestamp = 0;
     
@@ -294,7 +393,10 @@ static int __csi2_queue_buffer_to_ring_locked(struct amd_csi2_device *csi2_dev,
     
     /* Update head */
     csi2_dev->ring_head = (head + 1) % RING_SIZE;
-    csi2_dev->ring->head = csi2_dev->ring_head;
+    csi2_dev->ring->head = cpu_to_le32(csi2_dev->ring_head);
+    
+    /* Write head register to notify device */
+    csi2_write_reg(csi2_dev, CSI2_RING_HEAD_REG, csi2_dev->ring_head);
     
     /* Memory barrier to ensure ring update is visible */
     wmb();
@@ -302,31 +404,17 @@ static int __csi2_queue_buffer_to_ring_locked(struct amd_csi2_device *csi2_dev,
     csi2_dev->queued_buffers++;
     
     csi2_dbg(4, &csi2_dev->pdev->dev, 
-             "Queued buffer %d to ring slot %u (dma: 0x%llx)\n",
-             buf->index, head, csi2_dev->ring->entries[head].dma_addr);
+             "Queued buffer %d to ring slot %u (dma: 0x%llx, %s memory)\n",
+             buf->index, head, dma_addr,
+             (csi2_dev->cxl_available && 
+              dma_addr >= csi2_dev->cxl_base_addr && 
+              dma_addr < csi2_dev->cxl_base_addr + csi2_dev->cxl_size) ? 
+             "CXL" : "DRAM");
     
     return 0;
 }
 
-static void csi2_queue_buffer_to_ring(struct amd_csi2_device *csi2_dev,
-                                     struct amd_csi2_buffer *buf)
-{
-    unsigned long flags;
-    int ret;
-    
-    spin_lock_irqsave(&csi2_dev->ring_lock, flags);
-    ret = __csi2_queue_buffer_to_ring_locked(csi2_dev, buf);
-    spin_unlock_irqrestore(&csi2_dev->ring_lock, flags);
-    
-    if (ret) {
-        /* Queue failed, return to buffer list */
-        spin_lock_irqsave(&csi2_dev->buffer_lock, flags);
-        list_add(&buf->list, &csi2_dev->buffer_list);
-        spin_unlock_irqrestore(&csi2_dev->buffer_lock, flags);
-    }
-}
-
-/* Must be called with ring_lock held */
+/* Process completed buffers - must be called with ring_lock held */
 static void __csi2_process_completed_buffers_locked(struct amd_csi2_device *csi2_dev,
                                                    struct list_head *done_list)
 {
@@ -379,7 +467,7 @@ static void __csi2_process_completed_buffers_locked(struct amd_csi2_device *csi2
         buf->in_ring = false;
 
         /* Set timestamp */
-        timestamp_ns = entry->timestamp;
+        timestamp_ns = le64_to_cpu(entry->timestamp);
         vbuf->vb2_buf.timestamp = timestamp_ns;
 
         /* Set metadata */
@@ -388,14 +476,14 @@ static void __csi2_process_completed_buffers_locked(struct amd_csi2_device *csi2
         vbuf->flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 
         /* Check buffer completion status */
-        if (entry->flags & 0x01) {  /* Completion flag */
+        if (le32_to_cpu(entry->flags) & 0x01) {  /* Completion flag */
             vb2_set_plane_payload(&vbuf->vb2_buf, 0, csi2_dev->format.sizeimage);
             csi2_dbg(4, &csi2_dev->pdev->dev, 
                      "Buffer %d marked as complete\n", buf->index);
         } else {
             csi2_dbg(2, &csi2_dev->pdev->dev, 
                      "WARNING: Buffer %d not marked as complete (flags=0x%x)\n", 
-                     buf->index, entry->flags);
+                     buf->index, le32_to_cpu(entry->flags));
         }
 
         /* Add to done list */
@@ -421,6 +509,7 @@ static void __csi2_process_completed_buffers_locked(struct amd_csi2_device *csi2
     }
 }
 
+/* IRQ work handler */
 static void csi2_irq_work_handler(struct work_struct *work)
 {
     struct amd_csi2_device *csi2_dev = container_of(work, 
@@ -485,7 +574,6 @@ static void csi2_irq_work_handler(struct work_struct *work)
             /* Ring full, put back to list and stop */
             spin_lock_irqsave(&csi2_dev->buffer_lock, flags);
             list_add(&buf->list, &csi2_dev->buffer_list);
-            spin_unlock_irqrestore(&csi2_dev->buffer_lock, flags);
             break;
         }
         queued++;
@@ -522,12 +610,13 @@ static void csi2_irq_work_handler(struct work_struct *work)
              processed, queued, work_time_us);
 }
 
+/* IRQ handler */
 static irqreturn_t amd_csi2_irq_handler(int irq, void *dev_id)
 {
     struct amd_csi2_device *csi2_dev = dev_id;
     u32 status;
     ktime_t now;
-    s64 interval_ns;
+    s64 interval_ns = 0;
     static int irq_count = 0;
     
     status = csi2_read_reg(csi2_dev, CSI2_INT_STATUS_REG);
@@ -656,6 +745,16 @@ static int queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
 {
     struct amd_csi2_device *csi2_dev = vb2_get_drv_priv(vq);
     unsigned int size = csi2_dev->format.sizeimage;
+
+    /* vb2_queue에 추가 정보 저장 */
+    if (csi2_dev->cxl_available && csi2_dev->cxl_pool) {
+        /* pool 참조를 queue에 연결하는 방법 필요 */
+        vq->mem_ops = &vb2_cxl_memops;
+
+        /* 디버깅 로그 */
+        csi2_dbg(3, &csi2_dev->pdev->dev,
+                 "queue_setup: Using CXL pool %p\n", csi2_dev->cxl_pool);
+    }
     
     csi2_dbg(4, &csi2_dev->pdev->dev,
              "queue_setup: nbuffers=%u, nplanes=%u\n", 
@@ -684,8 +783,9 @@ static int queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
         alloc_devs[0] = &csi2_dev->pdev->dev;
     
     csi2_dbg(3, &csi2_dev->pdev->dev,
-             "Allocating %u buffers, size=%u\n", 
-             *nbuffers, sizes[0]);
+             "Allocating %u buffers, size=%u, using %s memory\n", 
+             *nbuffers, sizes[0],
+             csi2_dev->cxl_available ? "CXL" : "system");
     
     return 0;
 }
@@ -695,10 +795,32 @@ static int buffer_init(struct vb2_buffer *vb)
     struct amd_csi2_device *csi2_dev = vb2_get_drv_priv(vb->vb2_queue);
     struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
     struct amd_csi2_buffer *buf = container_of(vbuf, struct amd_csi2_buffer, vb2_buf);
+    dma_addr_t dma_addr;
+    void *cookie;
     
     INIT_LIST_HEAD(&buf->list);
     buf->index = vb->index;
     buf->in_ring = false;
+    
+    /* Check if this buffer is in CXL memory */
+    cookie = vb2_plane_cookie(vb, 0);
+    if (cookie) {
+        dma_addr = (dma_addr_t)(uintptr_t)cookie;
+        
+        if (csi2_dev->cxl_available &&
+            dma_addr >= csi2_dev->cxl_base_addr && 
+            dma_addr < csi2_dev->cxl_base_addr + csi2_dev->cxl_size) {
+            csi2_dev->cxl_buffers++;
+            csi2_dbg(4, &csi2_dev->pdev->dev,
+                     "Buffer %d allocated in CXL memory at 0x%llx\n",
+                     vb->index, dma_addr);
+        } else {
+            csi2_dev->dram_buffers++;
+            csi2_dbg(4, &csi2_dev->pdev->dev,
+                     "Buffer %d allocated in DRAM at 0x%llx\n",
+                     vb->index, dma_addr);
+        }
+    }
     
     csi2_dbg(4, &csi2_dev->pdev->dev,
              "buffer_init: index=%d, type=%d\n",
@@ -729,13 +851,6 @@ static int buffer_prepare(struct vb2_buffer *vb)
     vbuf->flags = 0;
     vbuf->field = V4L2_FIELD_NONE;
     buf->index = vb->index;
-    
-    /* Clear buffer to avoid "corrupted data" warning */
-    if (csi2_dev->first_frame) {
-        void *vaddr = vb2_plane_vaddr(vb, 0);
-        if (vaddr)
-            memset(vaddr, 0, size);
-    }
     
     return 0;
 }
@@ -876,7 +991,10 @@ static int start_streaming(struct vb2_queue *vq, unsigned int count)
     csi2_dev->streaming = true;
     csi2_write_reg(csi2_dev, CSI2_CORE_CONFIG_REG, CSI2_CORE_CONFIG_ENABLE);
     
-    csi2_dbg(3, &csi2_dev->pdev->dev, "Streaming started successfully\n");
+    csi2_dbg(3, &csi2_dev->pdev->dev, 
+             "Streaming started successfully (P2P: %s, CXL: %s)\n",
+             csi2_dev->p2p_enabled ? "enabled" : "disabled",
+             csi2_dev->cxl_available ? "available" : "not available");
     
     return 0;
     
@@ -902,7 +1020,6 @@ static void stop_streaming(struct vb2_queue *vq)
     struct amd_csi2_device *csi2_dev = vb2_get_drv_priv(vq);
     
     csi2_dbg(3, &csi2_dev->pdev->dev, "stop_streaming: START\n");
-    csi2_dump_all_buffer_states(csi2_dev, "stop_streaming start");
     
     /* 1. Immediately stop streaming flag */
     csi2_dev->streaming = false;
@@ -913,23 +1030,25 @@ static void stop_streaming(struct vb2_queue *vq)
     csi2_write_reg(csi2_dev, CSI2_CORE_CONFIG_REG, 0);
     csi2_write_reg(csi2_dev, CSI2_RING_CTRL_REG, RING_CTRL_RESET);
     
-    /* 3. Wait for any pending IRQ handler to complete */
+    /* 3. Disable P2P if it was enabled */
+    if (csi2_dev->p2p_enabled) {
+        csi2_write_reg(csi2_dev, CSI2_P2P_ENABLE_REG, 0);
+    }
+    
+    /* 4. Wait for any pending IRQ handler to complete */
     if (csi2_dev->irq > 0) {
         synchronize_irq(csi2_dev->irq);
     }
     
-    /* 4. Cancel and flush all work */
+    /* 5. Cancel and flush all work */
     cancel_work_sync(&csi2_dev->irq_work);
     flush_workqueue(csi2_dev->work_queue);
     
-    /* 5. Memory barrier */
+    /* 6. Memory barrier */
     mb();
     
-    /* 6. Return all buffers */
+    /* 7. Return all buffers */
     csi2_return_all_buffers(csi2_dev, VB2_BUF_STATE_ERROR);
-    
-    /* 7. Final state dump */
-    csi2_dump_all_buffer_states(csi2_dev, "stop_streaming end");
     
     /* 8. Print final statistics */
     if (csi2_dev->interval_count > 0) {
@@ -954,9 +1073,12 @@ static void stop_streaming(struct vb2_queue *vq)
     }
     
     csi2_dbg(3, &csi2_dev->pdev->dev,
-             "stop_streaming: END - queued=%u, completed=%u, dropped=%u\n",
+             "stop_streaming: END - queued=%u completed=%u dropped=%u\n",
              csi2_dev->queued_buffers, csi2_dev->completed_buffers,
              csi2_dev->dropped_frames);
+    csi2_dbg(2, &csi2_dev->pdev->dev,
+             "Buffer allocation - CXL:%u DRAM:%u\n",
+             csi2_dev->cxl_buffers, csi2_dev->dram_buffers);
 }
 
 static const struct vb2_ops amd_csi2_vb2_ops = {
@@ -970,7 +1092,7 @@ static const struct vb2_ops amd_csi2_vb2_ops = {
     .wait_finish = vb2_ops_wait_finish,
 };
 
-/* V4L2 ioctl operations */
+/* V4L2 ioctl operations - unchanged from original */
 static int amd_csi2_querycap(struct file *file, void *priv,
                             struct v4l2_capability *cap)
 {
@@ -1028,8 +1150,10 @@ static int amd_csi2_s_fmt_vid_cap(struct file *file, void *priv,
                                  struct v4l2_format *f)
 {
     struct amd_csi2_device *csi2_dev = video_drvdata(file);
+    struct vb2_queue *q = csi2_dev->cxl_available ? 
+                          &csi2_dev->queue_ctx.queue : &csi2_dev->queue;
     
-    if (vb2_is_busy(&csi2_dev->queue))
+    if (vb2_is_busy(q))
         return -EBUSY;
     
     amd_csi2_try_fmt_vid_cap(file, priv, f);
@@ -1164,99 +1288,105 @@ static int amd_csi2_enum_frameintervals(struct file *file, void *priv,
 static const struct v4l2_ioctl_ops amd_csi2_ioctl_ops = {
     .vidioc_querycap = amd_csi2_querycap,
     .vidioc_enum_fmt_vid_cap = amd_csi2_enum_fmt_vid_cap,
-    .vidioc_g_fmt_vid_cap = amd_csi2_g_fmt_vid_cap,
-    .vidioc_try_fmt_vid_cap = amd_csi2_try_fmt_vid_cap,
-    .vidioc_s_fmt_vid_cap = amd_csi2_s_fmt_vid_cap,
-    .vidioc_enum_input = amd_csi2_enum_input,
-    .vidioc_g_input = amd_csi2_g_input,
-    .vidioc_s_input = amd_csi2_s_input,
-    .vidioc_reqbufs = amd_csi2_vidioc_reqbufs,
-    .vidioc_querybuf = amd_csi2_vidioc_querybuf,
-    .vidioc_qbuf = vb2_ioctl_qbuf,
-    .vidioc_dqbuf = vb2_ioctl_dqbuf,
-    .vidioc_prepare_buf = vb2_ioctl_prepare_buf,
-    .vidioc_streamon = vb2_ioctl_streamon,
-    .vidioc_streamoff = vb2_ioctl_streamoff,
-    .vidioc_enum_framesizes = amd_csi2_enum_framesizes,
-    .vidioc_enum_frameintervals = amd_csi2_enum_frameintervals,
-    .vidioc_g_parm = amd_csi2_vidioc_g_parm,
-    .vidioc_s_parm = amd_csi2_vidioc_s_parm,
+   .vidioc_g_fmt_vid_cap = amd_csi2_g_fmt_vid_cap,
+   .vidioc_try_fmt_vid_cap = amd_csi2_try_fmt_vid_cap,
+   .vidioc_s_fmt_vid_cap = amd_csi2_s_fmt_vid_cap,
+   .vidioc_enum_input = amd_csi2_enum_input,
+   .vidioc_g_input = amd_csi2_g_input,
+   .vidioc_s_input = amd_csi2_s_input,
+   .vidioc_reqbufs = amd_csi2_vidioc_reqbufs,
+   .vidioc_querybuf = amd_csi2_vidioc_querybuf,
+   .vidioc_qbuf = vb2_ioctl_qbuf,
+   .vidioc_dqbuf = vb2_ioctl_dqbuf,
+   .vidioc_prepare_buf = vb2_ioctl_prepare_buf,
+   .vidioc_streamon = vb2_ioctl_streamon,
+   .vidioc_streamoff = vb2_ioctl_streamoff,
+   .vidioc_enum_framesizes = amd_csi2_enum_framesizes,
+   .vidioc_enum_frameintervals = amd_csi2_enum_frameintervals,
+   .vidioc_g_parm = amd_csi2_vidioc_g_parm,
+   .vidioc_s_parm = amd_csi2_vidioc_s_parm,
 };
 
 static const struct v4l2_file_operations amd_csi2_fops = {
-    .owner = THIS_MODULE,
-    .open = v4l2_fh_open,
-    .release = vb2_fop_release,
-    .poll = vb2_fop_poll,
-    .mmap = vb2_fop_mmap,
-    .unlocked_ioctl = video_ioctl2,
+   .owner = THIS_MODULE,
+   .open = v4l2_fh_open,
+   .release = vb2_fop_release,
+   .poll = vb2_fop_poll,
+   .mmap = vb2_fop_mmap,
+   .unlocked_ioctl = video_ioctl2,
 };
 
 /* Sysfs attributes */
 static ssize_t stats_show(struct device *dev,
-                         struct device_attribute *attr, char *buf)
+                        struct device_attribute *attr, char *buf)
 {
-    struct pci_dev *pdev = to_pci_dev(dev);
-    struct amd_csi2_device *csi2_dev = pci_get_drvdata(pdev);
-    u32 frame_count, error_count;
-    unsigned long flags;
-    int ring_occupancy;
+   struct pci_dev *pdev = to_pci_dev(dev);
+   struct amd_csi2_device *csi2_dev = pci_get_drvdata(pdev);
+   u32 frame_count, error_count;
+   unsigned long flags;
+   int ring_occupancy;
 
-    if (!csi2_dev)
-        return -ENODEV;
+   if (!csi2_dev)
+       return -ENODEV;
 
-    frame_count = csi2_read_reg(csi2_dev, CSI2_FRAME_COUNT_REG);
-    error_count = csi2_read_reg(csi2_dev, CSI2_ERROR_COUNT_REG);
-    
-    spin_lock_irqsave(&csi2_dev->ring_lock, flags);
-    ring_occupancy = ring_count(csi2_dev->ring_head, csi2_dev->ring_tail, RING_SIZE);
-    spin_unlock_irqrestore(&csi2_dev->ring_lock, flags);
+   frame_count = csi2_read_reg(csi2_dev, CSI2_FRAME_COUNT_REG);
+   error_count = csi2_read_reg(csi2_dev, CSI2_ERROR_COUNT_REG);
 
-    return sprintf(buf,
-                  "frames: %u\n"
-                  "queued: %u\n"
-                  "completed: %u\n"
-                  "dropped: %u\n"
-                  "errors: %u\n"
-                  "hw_frames: %u\n"
-                  "hw_errors: %u\n"
-                  "ring_occupancy: %d/%d\n",
-                  csi2_dev->sequence,
-                  csi2_dev->queued_buffers,
-                  csi2_dev->completed_buffers,
-                  csi2_dev->dropped_frames,
-                  csi2_dev->errors,
-                  frame_count,
-                  error_count,
-                  ring_occupancy, RING_SIZE);
+   spin_lock_irqsave(&csi2_dev->ring_lock, flags);
+   ring_occupancy = ring_count(csi2_dev->ring_head, csi2_dev->ring_tail, RING_SIZE);
+   spin_unlock_irqrestore(&csi2_dev->ring_lock, flags);
+
+   return sprintf(buf,
+                 "frames: %u\n"
+                 "queued: %u\n"
+                 "completed: %u\n"
+                 "dropped: %u\n"
+                 "errors: %u\n"
+                 "hw_frames: %u\n"
+                 "hw_errors: %u\n"
+                 "ring_occupancy: %d/%d\n"
+                 "cxl_buffers: %u\n"
+                 "dram_buffers: %u\n"
+                 "p2p_enabled: %s\n",
+                 csi2_dev->sequence,
+                 csi2_dev->queued_buffers,
+                 csi2_dev->completed_buffers,
+                 csi2_dev->dropped_frames,
+                 csi2_dev->errors,
+                 frame_count,
+                 error_count,
+                 ring_occupancy, RING_SIZE,
+                 csi2_dev->cxl_buffers,
+                 csi2_dev->dram_buffers,
+                 csi2_dev->p2p_enabled ? "yes" : "no");
 }
 static DEVICE_ATTR_RO(stats);
 
 static ssize_t timing_stats_show(struct device *dev,
-                                struct device_attribute *attr, char *buf)
+                               struct device_attribute *attr, char *buf)
 {
-    struct pci_dev *pdev = to_pci_dev(dev);
-    struct amd_csi2_device *csi2_dev = pci_get_drvdata(pdev);
-    s64 avg_ns = 0;
-    s64 avg_work_us = 0;
-    u32 actual_fps_int, actual_fps_frac;
-    
-    if (!csi2_dev || csi2_dev->interval_count == 0)
-        return -ENODEV;
-    
-    avg_ns = ktime_to_ns(csi2_dev->total_interval) / csi2_dev->interval_count;
-    
-    if (csi2_dev->work_count > 0) {
-        avg_work_us = ktime_to_us(csi2_dev->total_work_time) / csi2_dev->work_count;
-    }
-    
-    /* Calculate FPS using integer arithmetic */
-    if (avg_ns > 0) {
-        /* FPS = 1000000000 / avg_ns */
-        /* To get two decimal places, multiply by 100 first */
-        u64 fps_x100 = 100000000000ULL / avg_ns;
-	actual_fps_int = fps_x100 / 100;
- 	actual_fps_frac = fps_x100 % 100;
+   struct pci_dev *pdev = to_pci_dev(dev);
+   struct amd_csi2_device *csi2_dev = pci_get_drvdata(pdev);
+   s64 avg_ns = 0;
+   s64 avg_work_us = 0;
+   u32 actual_fps_int, actual_fps_frac;
+
+   if (!csi2_dev || csi2_dev->interval_count == 0)
+       return -ENODEV;
+
+   avg_ns = ktime_to_ns(csi2_dev->total_interval) / csi2_dev->interval_count;
+
+   if (csi2_dev->work_count > 0) {
+       avg_work_us = ktime_to_us(csi2_dev->total_work_time) / csi2_dev->work_count;
+   }
+
+   /* Calculate FPS using integer arithmetic */
+   if (avg_ns > 0) {
+       /* FPS = 1000000000 / avg_ns */
+       /* To get two decimal places, multiply by 100 first */
+       u64 fps_x100 = 100000000000ULL / avg_ns;
+       actual_fps_int = fps_x100 / 100;
+       actual_fps_frac = fps_x100 % 100;
    } else {
        actual_fps_int = 0;
        actual_fps_frac = 0;
@@ -1293,8 +1423,8 @@ static ssize_t timing_stats_show(struct device *dev,
 static DEVICE_ATTR_RO(timing_stats);
 
 static ssize_t timing_reset_store(struct device *dev,
-                                struct device_attribute *attr,
-                                const char *buf, size_t count)
+                               struct device_attribute *attr,
+                               const char *buf, size_t count)
 {
    struct pci_dev *pdev = to_pci_dev(dev);
    struct amd_csi2_device *csi2_dev = pci_get_drvdata(pdev);
@@ -1318,10 +1448,45 @@ static ssize_t timing_reset_store(struct device *dev,
 }
 static DEVICE_ATTR_WO(timing_reset);
 
+static ssize_t memory_type_show(struct device *dev,
+                              struct device_attribute *attr, char *buf)
+{
+   struct pci_dev *pdev = to_pci_dev(dev);
+   struct amd_csi2_device *csi2_dev = pci_get_drvdata(pdev);
+
+   return sprintf(buf, "%s\n",
+                  csi2_dev->cxl_available ? "CXL" : "System");
+}
+static DEVICE_ATTR_RO(memory_type);
+
+static ssize_t cxl_info_show(struct device *dev,
+                           struct device_attribute *attr, char *buf)
+{
+   struct pci_dev *pdev = to_pci_dev(dev);
+   struct amd_csi2_device *csi2_dev = pci_get_drvdata(pdev);
+
+   if (!csi2_dev->cxl_available) {
+       return sprintf(buf, "CXL not available\n");
+   }
+
+   return sprintf(buf,
+                 "CXL base address: 0x%llx\n"
+                 "CXL size: %zu MB\n"
+                 "CXL device: %s\n"
+                 "P2P enabled: %s\n",
+                 csi2_dev->cxl_base_addr,
+                 csi2_dev->cxl_size >> 20,
+                 csi2_dev->cxl_pdev ? pci_name(csi2_dev->cxl_pdev) : "none",
+                 csi2_dev->p2p_enabled ? "yes" : "no");
+}
+static DEVICE_ATTR_RO(cxl_info);
+
 static struct attribute *amd_csi2_attrs[] = {
    &dev_attr_stats.attr,
    &dev_attr_timing_stats.attr,
    &dev_attr_timing_reset.attr,
+   &dev_attr_memory_type.attr,
+   &dev_attr_cxl_info.attr,
    NULL
 };
 
@@ -1337,17 +1502,35 @@ static const struct attribute_group *amd_csi2_groups[] = {
 /* Device initialization */
 static int amd_csi2_init_video_device(struct amd_csi2_device *csi2_dev)
 {
-   struct video_device *vdev;
-   struct vb2_queue *q;
-   int ret;
+    struct video_device *vdev;
+    struct vb2_queue *q;
+    int ret;
 
-   /* Initialize VB2 queue */
-   q = &csi2_dev->queue;
-   q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-   q->io_modes = VB2_MMAP | VB2_DMABUF;
-   q->drv_priv = csi2_dev;
-   q->ops = &amd_csi2_vb2_ops;
-   q->mem_ops = &vb2_dma_contig_memops;
+    /* Initialize VB2 queue pointer first */
+    if (csi2_dev->cxl_available && use_cxl_memory) {
+        q = &csi2_dev->queue_ctx.queue;
+    } else {
+        q = &csi2_dev->queue;
+    }
+
+    /* Then set memory operations */
+    if (csi2_dev->use_nvme_cmb) {
+        q->mem_ops = &vb2_nvme_cmb_memops;
+        csi2_dbg(2, &csi2_dev->pdev->dev, "Using NVMe CMB memory allocator\n");
+    } else if (csi2_dev->cxl_available && use_cxl_memory) {
+        csi2_dev->queue_ctx.pool = csi2_dev->cxl_pool;
+        q->mem_ops = &vb2_cxl_memops;
+        csi2_dbg(2, &csi2_dev->pdev->dev, "Using CXL memory allocator\n");
+    } else {
+        q->mem_ops = &vb2_dma_contig_memops;
+        csi2_dbg(2, &csi2_dev->pdev->dev, "Using system memory allocator\n");
+    }
+
+    /* Continue with queue initialization */
+    q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    q->io_modes = VB2_MMAP | VB2_DMABUF;
+    q->drv_priv = csi2_dev;
+    q->ops = &amd_csi2_vb2_ops;
    q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC |
                        V4L2_BUF_FLAG_TSTAMP_SRC_EOF;
    q->lock = &csi2_dev->mutex;
@@ -1403,7 +1586,7 @@ static int amd_csi2_init_video_device(struct amd_csi2_device *csi2_dev)
    }
 
    csi2_dbg(3, &csi2_dev->pdev->dev, "Video device registered as %s\n",
-            video_device_node_name(vdev));
+           video_device_node_name(vdev));
 
    return 0;
 
@@ -1419,6 +1602,7 @@ err_vb2_release:
 static int amd_csi2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
    struct amd_csi2_device *csi2_dev;
+   struct vb2_cxl_pool_info cxl_info;
    int ret;
    int irq_vectors = 0;
 
@@ -1439,12 +1623,6 @@ static int amd_csi2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
    spin_lock_init(&csi2_dev->ring_lock);
    INIT_LIST_HEAD(&csi2_dev->buffer_list);
    INIT_WORK(&csi2_dev->irq_work, csi2_irq_work_handler);
-
-#ifdef CONFIG_LOCKDEP
-   /* Set lock classes for lockdep */
-   lockdep_set_class(&csi2_dev->buffer_lock, &buffer_lock_key);
-   lockdep_set_class(&csi2_dev->ring_lock, &ring_lock_key);
-#endif
 
    /* Create dedicated workqueue with high priority */
    csi2_dev->work_queue = alloc_workqueue("amd-csi2",
@@ -1497,9 +1675,16 @@ static int amd_csi2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
        goto err_release_regions;
    }
 
+   /* Check hardware version */
+   ret = amd_csi2_check_hw_version(csi2_dev);
+   if (ret < 0) {
+       csi2_dbg(2, &pdev->dev, "Hardware version check failed, P2P will be disabled\n");
+       /* Continue without P2P support */
+   }
+
    /* Allocate ring buffer */
    csi2_dev->ring = dma_alloc_coherent(&pdev->dev, sizeof(struct ring_buffer),
-                                       &csi2_dev->ring_dma, GFP_KERNEL);
+                                      &csi2_dev->ring_dma, GFP_KERNEL);
    if (!csi2_dev->ring) {
        csi2_dbg(1, &pdev->dev, "Failed to allocate ring buffer\n");
        ret = -ENOMEM;
@@ -1523,10 +1708,10 @@ static int amd_csi2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
        /* MSI or MSI-X */
        csi2_dev->irq = pci_irq_vector(pdev, 0);
        ret = request_irq(csi2_dev->irq, amd_csi2_irq_handler, 0,
-                         DRIVER_NAME, csi2_dev);
+                        DRIVER_NAME, csi2_dev);
        if (ret) {
            csi2_dbg(1, &pdev->dev, "Failed to request MSI/MSI-X IRQ %d: %d\n",
-                    csi2_dev->irq, ret);
+                   csi2_dev->irq, ret);
            goto err_free_irq_vectors;
        }
        csi2_dbg(3, &pdev->dev, "Using MSI/MSI-X IRQ %d\n", csi2_dev->irq);
@@ -1539,14 +1724,63 @@ static int amd_csi2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
            goto err_free_ring;
        }
        ret = request_irq(csi2_dev->irq, amd_csi2_irq_handler, IRQF_SHARED,
-                         DRIVER_NAME, csi2_dev);
+                        DRIVER_NAME, csi2_dev);
        if (ret) {
            csi2_dbg(1, &pdev->dev, "Failed to request legacy IRQ %d: %d\n",
-                    csi2_dev->irq, ret);
+                   csi2_dev->irq, ret);
            goto err_free_ring;
        }
        csi2_dbg(3, &pdev->dev, "Using legacy IRQ %d\n", csi2_dev->irq);
    }
+
+   /* Initialize memory allocator support */
+    if (use_nvme_cmb) {
+        /* Try NVMe CMB first */
+        ret = vb2_nvme_cmb_init(NULL);  /* Auto-detect NVMe */
+        if (ret == 0) {
+            csi2_dev->use_nvme_cmb = true;
+            csi2_dbg(2, &pdev->dev, "NVMe CMB initialized successfully\n");
+        } else {
+            csi2_dbg(2, &pdev->dev, "NVMe CMB init failed (%d), falling back to CXL/DRAM\n", ret);
+            csi2_dev->use_nvme_cmb = false;
+
+            /* Fall back to CXL if enabled */
+            if (use_cxl_memory) {
+                /* Create CXL pool */
+                csi2_dev->cxl_pool = vb2_cxl_pool_create("csi2", MEMREMAP_WB);
+                /* ... 나머지 CXL 초기화 코드 ... */
+            }
+        }
+    }  /* Initialize CXL support */
+    else if (use_cxl_memory) {
+	        /* Create CXL pool */
+        	csi2_dev->cxl_pool = vb2_cxl_pool_create("csi2", MEMREMAP_WB);
+	        if (!IS_ERR(csi2_dev->cxl_pool)) {
+        	    /* Get actual CXL memory information */
+	            ret = vb2_cxl_pool_get_info(csi2_dev->cxl_pool, &cxl_info);
+        	    if (ret == 0) {
+	                csi2_dev->cxl_available = true;
+        	        csi2_dev->cxl_base_addr = cxl_info.phys_addr;
+                	csi2_dev->cxl_size = cxl_info.size;
+	                csi2_dev->cxl_pdev = cxl_info.pci_dev;  /* 이 부분이 중요 */
+
+        	        /* pci_dev 참조 카운트 증가 */
+                	if (csi2_dev->cxl_pdev)
+	                    pci_dev_get(csi2_dev->cxl_pdev);
+
+        	        csi2_dbg(2, &pdev->dev, "CXL memory initialized: 0x%llx, %zu MB, device: %s\n",
+                	         csi2_dev->cxl_base_addr, csi2_dev->cxl_size >> 20,
+                        	 csi2_dev->cxl_pdev ? pci_name(csi2_dev->cxl_pdev) : "none");
+
+	                /* Try to setup P2P */
+        	        ret = csi2_setup_p2p_for_cxl(csi2_dev);
+                	if (ret < 0) {
+	                    csi2_dbg(2, &pdev->dev, "P2P setup failed: %d\n", ret);
+        	        }
+	            }
+	        }
+	}
+
 
    /* Reset device */
    csi2_write_reg(csi2_dev, CSI2_CORE_CONFIG_REG, CSI2_CORE_CONFIG_RESET);
@@ -1558,7 +1792,7 @@ static int amd_csi2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
    ret = sysfs_create_groups(&pdev->dev.kobj, amd_csi2_groups);
    if (ret) {
        csi2_dbg(1, &pdev->dev, "Failed to create sysfs attributes\n");
-       goto err_free_irq;
+       goto err_cleanup_cxl;
    }
 
    /* Initialize video device */
@@ -1568,13 +1802,19 @@ static int amd_csi2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
        goto err_remove_sysfs;
    }
 
-   csi2_dbg(3, &pdev->dev, "AMD CSI-2 device probed successfully (v2.5)\n");
+   csi2_dbg(3, &pdev->dev, "AMD CSI-2 device probed successfully (v3.1)\n");
+   csi2_dbg(2, &pdev->dev, "CXL: %s, P2P: %s\n",
+            csi2_dev->cxl_available ? "available" : "not available",
+            csi2_dev->p2p_enabled ? "enabled" : "disabled");
 
    return 0;
 
 err_remove_sysfs:
    sysfs_remove_groups(&pdev->dev.kobj, amd_csi2_groups);
-err_free_irq:
+err_cleanup_cxl:
+   if (csi2_dev->cxl_pool) {
+       vb2_cxl_pool_destroy(csi2_dev->cxl_pool);
+   }
    if (csi2_dev->irq > 0) {
        free_irq(csi2_dev->irq, csi2_dev);
        csi2_dev->irq = -1;
@@ -1584,7 +1824,7 @@ err_free_irq_vectors:
        pci_free_irq_vectors(pdev);
 err_free_ring:
    dma_free_coherent(&pdev->dev, sizeof(struct ring_buffer),
-                     csi2_dev->ring, csi2_dev->ring_dma);
+                    csi2_dev->ring, csi2_dev->ring_dma);
 err_iounmap:
    iounmap(csi2_dev->mmio_base);
 err_release_regions:
@@ -1614,6 +1854,9 @@ static void amd_csi2_remove(struct pci_dev *pdev)
        csi2_write_reg(csi2_dev, CSI2_GLOBAL_INT_EN_REG, 0);
        csi2_write_reg(csi2_dev, CSI2_CORE_CONFIG_REG, 0);
        csi2_write_reg(csi2_dev, CSI2_RING_CTRL_REG, RING_CTRL_RESET);
+       if (csi2_dev->p2p_enabled) {
+           csi2_write_reg(csi2_dev, CSI2_P2P_ENABLE_REG, 0);
+       }
    }
 
    /* Unregister video device */
@@ -1639,6 +1882,16 @@ static void amd_csi2_remove(struct pci_dev *pdev)
    if (pci_dev_msi_enabled(pdev)) {
        pci_free_irq_vectors(pdev);
    }
+
+   /* Cleanup CXL */
+   if (csi2_dev->cxl_pool) {
+       vb2_cxl_pool_destroy(csi2_dev->cxl_pool);
+   }
+
+   /* Cleanup memory allocators */
+    if (csi2_dev->use_nvme_cmb) {
+        vb2_nvme_cmb_cleanup();
+    }
 
    /* Destroy workqueue */
    if (csi2_dev->work_queue) {
@@ -1686,6 +1939,7 @@ static struct pci_driver amd_csi2_pci_driver = {
 module_pci_driver(amd_csi2_pci_driver);
 
 MODULE_AUTHOR("AMD");
-MODULE_DESCRIPTION("AMD CSI-2 RX PCIe V4L2 Driver with Ring Buffer (v2.5)");
+MODULE_DESCRIPTION("AMD CSI-2 RX PCIe V4L2 Driver with CXL Memory Support (v3.1)");
 MODULE_LICENSE("GPL v2");
-MODULE_VERSION("2.5");
+MODULE_VERSION("3.1");
+MODULE_SOFTDEP("pre: videobuf2-cxl");
