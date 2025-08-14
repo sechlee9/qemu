@@ -28,7 +28,7 @@
 #define CSI2_RING_SIZE      32
 
 /* Debug macro */
-//#define CSI2_DEBUG 
+#define CSI2_DEBUG 
 
 #ifdef CSI2_DEBUG
 #define CSI2_DPRINTF(fmt, ...) \
@@ -54,6 +54,13 @@
 #define CSI2_RING_TAIL_REG              0x110  /* QEMU writes, Driver reads */
 #define CSI2_RING_CTRL_REG              0x114
 #define CSI2_RING_STATUS_REG            0x118
+
+/* P2P DMA Registers */
+#define CSI2_P2P_CONFIG_REG             0x400
+#define CSI2_P2P_TARGET_LOW             0x404
+#define CSI2_P2P_TARGET_HIGH            0x408
+#define CSI2_P2P_ENABLE_REG             0x40C
+#define CSI2_VERSION_REG                0x410
 
 /* Format Registers */
 #define CSI2_FORMAT_REG                 0x200
@@ -87,6 +94,13 @@
 #define CSI2_INT_FRAME_DONE             (1U << 0)
 #define CSI2_INT_RING_FULL              (1U << 1)
 #define CSI2_INT_ERROR                  (1U << 2)
+
+/* P2P control bits */
+#define P2P_CONFIG_ENABLE               (1U << 0)
+#define P2P_CONFIG_CXL_MODE             (1U << 1)
+
+/* Version */
+#define CSI2_VERSION_P2P                0x0300
 
 /* Test pattern types */
 typedef enum {
@@ -168,6 +182,14 @@ typedef struct AmdCsi2RxPcieState {
     bool use_realtime_clock;
     uint32_t timer_slack_ns;  /* Changed from int to uint32_t */
     int64_t stream_start_time;
+
+    /* P2P DMA support */
+    uint32_t p2p_config;
+    uint64_t p2p_target_addr;
+    bool p2p_enabled;
+
+    /* Version */
+    uint32_t hw_version;
 } AmdCsi2RxPcieState;
 
 /* Static buffer for frame generation */
@@ -489,13 +511,29 @@ static void csi2_process_frame(AmdCsi2RxPcieState *s)
     
     /* Generate frame data */
     generate_test_frame(frame_generation_buffer, entry.size, s->frame_count, s);
-    
-    /* Write frame data to guest memory */
-    if (pci_dma_write(pci_dev, entry.dma_addr, frame_generation_buffer, entry.size) != 0) {
-        CSI2_DPRINTF("Failed to write frame data");
-        s->error_count++;
-        return;
-    }
+
+    /* Write frame data based on P2P configuration */
+    if (s->p2p_enabled && s->p2p_target_addr) {
+        /* P2P DMA 모드 - CXL 메모리에 직접 쓰기 */
+        CSI2_DPRINTF("Using P2P DMA to CXL memory at 0x%lx", s->p2p_target_addr);
+        
+        /* P2P DMA 시뮬레이션
+         * 실제로는 PCIe 스위치를 통해 직접 전송되지만,
+         * QEMU에서는 메모리 접근으로 시뮬레이션
+         */
+        if (pci_dma_write(pci_dev, entry.dma_addr, frame_generation_buffer, entry.size) != 0) {
+            CSI2_DPRINTF("Failed to write frame data via P2P");
+            s->error_count++;
+            return;
+        }
+    } else {
+        /* 일반 DMA 모드 */
+        if (pci_dma_write(pci_dev, entry.dma_addr, frame_generation_buffer, entry.size) != 0) {
+            CSI2_DPRINTF("Failed to write frame data");
+            s->error_count++;
+            return;
+        }
+    }    
     
     /* Update entry with completion info */
     entry.flags = cpu_to_le32(1);  /* Mark as complete */
@@ -749,6 +787,26 @@ static uint64_t csi2_mmio_read(void *opaque, hwaddr addr, unsigned size)
             val = (s->next_frame_time - now) / 1000000;
         }
         break;
+
+    case CSI2_P2P_CONFIG_REG:
+        val = s->p2p_config;
+        break;
+
+    case CSI2_P2P_TARGET_LOW:
+        val = s->p2p_target_addr & 0xFFFFFFFF;
+        break;
+
+    case CSI2_P2P_TARGET_HIGH:
+        val = s->p2p_target_addr >> 32;
+        break;
+
+    case CSI2_P2P_ENABLE_REG:
+        val = s->p2p_enabled ? 1 : 0;
+        break;
+
+    case CSI2_VERSION_REG:
+        val = s->hw_version;
+        break;
         
     default:
         CSI2_DPRINTF("Read from unknown register 0x%lx", addr);
@@ -849,6 +907,35 @@ static void csi2_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
             s->frame_period_ns = 1000000000LL / s->fps;
         }
         break;
+
+    /* P2P DMA registers */
+    case CSI2_P2P_CONFIG_REG:
+        s->p2p_config = val;
+        if (val & P2P_CONFIG_ENABLE) {
+            s->p2p_enabled = true;
+            CSI2_DPRINTF("P2P DMA enabled (CXL mode: %s)",
+                        (val & P2P_CONFIG_CXL_MODE) ? "yes" : "no");
+        } else {
+            s->p2p_enabled = false;
+            CSI2_DPRINTF("P2P DMA disabled");
+        }
+        break;
+
+    case CSI2_P2P_TARGET_LOW:
+        s->p2p_target_addr = (s->p2p_target_addr & 0xFFFFFFFF00000000ULL) | val;
+        CSI2_DPRINTF("P2P target low: 0x%08lx", val);
+        break;
+
+    case CSI2_P2P_TARGET_HIGH:
+        s->p2p_target_addr = (s->p2p_target_addr & 0xFFFFFFFFULL) | (val << 32);
+        CSI2_DPRINTF("P2P target high: 0x%08lx, full address: 0x%lx",
+                    val, s->p2p_target_addr);
+        break;
+
+    case CSI2_P2P_ENABLE_REG:
+        s->p2p_enabled = (val & 1) ? true : false;
+        CSI2_DPRINTF("P2P enable: %d", s->p2p_enabled);
+        break;
         
     default:
         CSI2_DPRINTF("Write to unknown register 0x%lx", addr);
@@ -895,6 +982,11 @@ static void amd_csi2_rx_pcie_reset(Object *obj, ResetType type)
     s->last_interrupt_time = 0;
     s->next_frame_time = 0;
     s->stream_start_time = 0;
+
+    /* Reset P2P configuration */
+    s->p2p_enabled = false;
+    s->p2p_config = 0;
+    s->p2p_target_addr = 0;
 }
 
 static void amd_csi2_rx_pcie_realize(PCIDevice *pci_dev, Error **errp)
@@ -916,6 +1008,12 @@ static void amd_csi2_rx_pcie_realize(PCIDevice *pci_dev, Error **errp)
     s->frame_period_ns = 1000000000LL / s->fps;
     s->use_realtime_clock = false;
     s->timer_slack_ns = 1000000;  /* 1ms - ensure this is uint32_t */
+
+    /* Initialize P2P support */
+    s->p2p_enabled = false;
+    s->p2p_config = 0;
+    s->p2p_target_addr = 0;
+    s->hw_version = CSI2_VERSION_P2P;  /* Support P2P */
     
     /* Set up PCI configuration */
     pci_config_set_vendor_id(pci_dev->config, XILINX_VENDOR_ID);
@@ -988,7 +1086,7 @@ static Property amd_csi2_rx_pcie_properties[] = {
 
 static const VMStateDescription vmstate_amd_csi2_rx_pcie = {
     .name = TYPE_AMD_CSI2_RX_PCIE,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(parent_obj, AmdCsi2RxPcieState),
@@ -1004,6 +1102,10 @@ static const VMStateDescription vmstate_amd_csi2_rx_pcie = {
         VMSTATE_UINT32(fps, AmdCsi2RxPcieState),
         VMSTATE_UINT32(frame_count, AmdCsi2RxPcieState),
         VMSTATE_UINT32(error_count, AmdCsi2RxPcieState),
+	VMSTATE_UINT32(p2p_config, AmdCsi2RxPcieState),
+        VMSTATE_UINT64(p2p_target_addr, AmdCsi2RxPcieState),
+        VMSTATE_BOOL(p2p_enabled, AmdCsi2RxPcieState),
+        VMSTATE_UINT32(hw_version, AmdCsi2RxPcieState),
         VMSTATE_END_OF_LIST()
     }
 };
