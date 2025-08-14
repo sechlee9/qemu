@@ -1,11 +1,26 @@
-# AMD CSI2 V4L2 Driver Makefile
+# AMD CSI2 V4L2 Driver Makefile with VideoBuf2-CXL and NVMe-CMB support
+# For QEMU Guest with custom kernel source
 
 obj-m += amd_csi2_v4l2.o
 
-# Build mode selection - NEW FEATURE
-POLLING_MODE ?= 0
+# Kernel source directory - QEMU guest kernel
+KERNEL_SRC := ../../generic/linux-6.15.4
+KDIR := $(KERNEL_SRC)
+PWD := $(shell pwd)
 
-# Build mode compiler flags - NEW
+# VideoBuf2 module directories - use absolute paths
+VB2_CXL_DIR := $(abspath ../videobuf2-cxl)
+VB2_NVME_CMB_DIR := $(abspath ../videobuf2-nvme-cmb)
+
+# Check if modules exist
+VB2_CXL_EXISTS := $(wildcard $(VB2_CXL_DIR)/Makefile)
+VB2_NVME_CMB_EXISTS := $(wildcard $(VB2_NVME_CMB_DIR)/Makefile)
+
+# Module symbol files
+CXL_SYMVERS := $(VB2_CXL_DIR)/Module.symvers
+NVME_SYMVERS := $(VB2_NVME_CMB_DIR)/Module.symvers
+
+# Build mode compiler flags
 ifeq ($(POLLING_MODE), 1)
     ccflags-y += -DCSI2_POLLING_MODE=1
     BUILD_MODE_STR := polling
@@ -14,432 +29,379 @@ else
     BUILD_MODE_STR := interrupt
 endif
 
-# QEMU Environment Detection and Kernel Directory Setup
-# Check if we're in QEMU with 9p filesystem (host development)
-KERNEL_SRC_HOST := ../../generic/linux-6.15.4
-KERNEL_SRC_GUEST := /lib/modules/$(shell uname -r)/build
-
-# Determine which kernel source to use
-ifneq ($(wildcard $(KERNEL_SRC_HOST)),)
-    # Host development environment (9p shared filesystem)
-    KDIR := $(KERNEL_SRC_HOST)
-    $(info Building with host kernel source: $(KDIR))
-else ifneq ($(wildcard $(KERNEL_SRC_GUEST)),)
-    # Guest environment with installed headers
-    KDIR := $(KERNEL_SRC_GUEST)
-    $(info Building with guest kernel headers: $(KDIR))
-else
-    # Fallback
-    $(error Neither host kernel source nor guest headers found!)
+# Include paths for videobuf2 modules
+ifneq ($(VB2_CXL_EXISTS),)
+    ccflags-y += -I$(VB2_CXL_DIR)
 endif
 
-# Build directory
-PWD := $(shell pwd)
+ifneq ($(VB2_NVME_CMB_EXISTS),)
+    ccflags-y += -I$(VB2_NVME_CMB_DIR)
+endif
 
-# Default target - now with environment detection
-all: check-env
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+# Check if we're in QEMU guest
+IS_QEMU := $(shell if dmesg 2>/dev/null | grep -qi "qemu\|kvm"; then echo "yes"; else echo "no"; fi)
 
-# NEW: Polling mode target
-polling:
-	@echo "Building AMD CSI2 V4L2 Driver in polling mode..."
-	$(MAKE) POLLING_MODE=1 all
+# Default target
+all: check-env build-cxl build-nvme-cmb build-csi2
 
-# NEW: Interrupt mode target (explicit)
-interrupt:
-	@echo "Building AMD CSI2 V4L2 Driver in interrupt mode..."
-	$(MAKE) POLLING_MODE=0 all
-
-# Environment check target - MODIFIED
+# Environment check
 check-env:
 	@echo "================================"
 	@echo "AMD CSI2 V4L2 Driver Build"
 	@echo "================================"
 	@echo "Build mode: $(BUILD_MODE_STR)"
-	@echo "Kernel source directory: $(KDIR)"
+	@echo "Kernel source: $(KERNEL_SRC)"
+	@echo "Kernel directory: $(KDIR)"
 	@echo "Build directory: $(PWD)"
 	@echo "Target architecture: $(shell uname -m)"
-	@echo "Kernel version: $(shell uname -r)"
-	@echo "================================"
-	@if [ ! -d "$(KDIR)" ]; then \
-		echo "ERROR: Kernel source directory not found!"; \
-		echo "Expected: $(KDIR)"; \
-		exit 1; \
+	@echo "Running kernel: $(shell uname -r)"
+	@echo "QEMU Guest: $(IS_QEMU)"
+	@if [ -d "$(VB2_CXL_DIR)" ]; then \
+		echo "VideoBuf2-CXL: Found at $(VB2_CXL_DIR)"; \
+	else \
+		echo "VideoBuf2-CXL: Not found - REQUIRED!"; \
+		echo "  Expected location: $(VB2_CXL_DIR)"; \
 	fi
-	@if [ ! -f "$(KDIR)/Makefile" ]; then \
-		echo "ERROR: Kernel Makefile not found in $(KDIR)"; \
+	@if [ -d "$(VB2_NVME_CMB_DIR)" ]; then \
+		echo "VideoBuf2-NVMe-CMB: Found at $(VB2_NVME_CMB_DIR)"; \
+	else \
+		echo "VideoBuf2-NVMe-CMB: Not found"; \
+		echo "  Expected location: $(VB2_NVME_CMB_DIR)"; \
+	fi
+	@echo "================================"
+	@if [ ! -d "$(KERNEL_SRC)" ]; then \
+		echo "❌ ERROR: Kernel source not found at $(KERNEL_SRC)"; \
+		exit 1; \
+	else \
+		echo "✅ Kernel source found"; \
+		if [ -f "$(KERNEL_SRC)/.config" ]; then \
+			echo "✅ Kernel appears to be configured"; \
+		else \
+			echo "⚠️  Warning: Kernel may not be configured"; \
+		fi; \
+	fi
+
+# Build VideoBuf2-CXL
+build-cxl:
+	@if [ -d "$(VB2_CXL_DIR)" ] && [ -f "$(VB2_CXL_DIR)/Makefile" ]; then \
+		echo "================================"; \
+		echo "Step 1: Building VideoBuf2-CXL module..."; \
+		echo "================================"; \
+		$(MAKE) -C $(VB2_CXL_DIR) KDIR=$(KDIR) all || exit 1; \
+		echo "✅ VideoBuf2-CXL built successfully"; \
+		echo ""; \
+	else \
+		echo "❌ ERROR: VideoBuf2-CXL directory not found"; \
 		exit 1; \
 	fi
 
-# Clean target - enhanced
+# Build VideoBuf2-NVMe-CMB
+build-nvme-cmb:
+	@if [ -d "$(VB2_NVME_CMB_DIR)" ] && [ -f "$(VB2_NVME_CMB_DIR)/Makefile" ]; then \
+		echo "================================"; \
+		echo "Step 2: Building VideoBuf2-NVMe-CMB module..."; \
+		echo "================================"; \
+		$(MAKE) -C $(VB2_NVME_CMB_DIR) KDIR=$(KDIR) all || exit 1; \
+		echo "✅ VideoBuf2-NVMe-CMB built successfully"; \
+		echo ""; \
+	fi
+
+# Build AMD CSI2 module
+build-csi2:
+	@echo "================================"
+	@echo "Step 3: Building AMD CSI2 V4L2 module..."
+	@echo "================================"
+	@# Check which symbol files exist
+	@SYMVERS_FILES=""; \
+	if [ -f "$(CXL_SYMVERS)" ]; then \
+		echo "  Using CXL symbols from $(CXL_SYMVERS)"; \
+		SYMVERS_FILES="$$SYMVERS_FILES $(CXL_SYMVERS)"; \
+	fi; \
+	if [ -f "$(NVME_SYMVERS)" ]; then \
+		echo "  Using NVMe-CMB symbols from $(NVME_SYMVERS)"; \
+		SYMVERS_FILES="$$SYMVERS_FILES $(NVME_SYMVERS)"; \
+	fi; \
+	if [ -n "$$SYMVERS_FILES" ]; then \
+		echo "  Building with external symbols..."; \
+		$(MAKE) -C $(KDIR) M=$(PWD) modules KBUILD_EXTRA_SYMBOLS="$$SYMVERS_FILES"; \
+	else \
+		echo "  Building without external symbols..."; \
+		$(MAKE) -C $(KDIR) M=$(PWD) modules; \
+	fi
+	@echo "✅ AMD CSI2 V4L2 module built successfully"
+
+# Clean all modules
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	@if [ -d "$(VB2_CXL_DIR)" ]; then \
+		echo "Cleaning VideoBuf2-CXL module..."; \
+		$(MAKE) -C $(VB2_CXL_DIR) KDIR=$(KDIR) clean; \
+	fi
+	@if [ -d "$(VB2_NVME_CMB_DIR)" ]; then \
+		echo "Cleaning VideoBuf2-NVMe-CMB module..."; \
+		$(MAKE) -C $(VB2_NVME_CMB_DIR) KDIR=$(KDIR) clean; \
+	fi
+	@if [ -d "$(KDIR)" ]; then \
+		$(MAKE) -C $(KDIR) M=$(PWD) clean; \
+	fi
 	rm -f Module.symvers modules.order
 	rm -rf ./modules
 	rm -f *.o *.mod.c *.mod *.cmd .*.cmd
 	rm -rf .tmp_versions
 	@echo "Build directory cleaned"
 
-# Install modprobe configuration
-install-config:
-	@echo "📋 Installing modprobe configuration..."
-	@if [ -f "amd_csi2.conf" ]; then \
-		sudo cp amd_csi2.conf /etc/modprobe.d/amd_csi2.conf; \
-		echo "✅ Configuration installed to /etc/modprobe.d/amd_csi2.conf"; \
+# Install modules
+install: all
+	@echo "Installing modules..."
+	@mkdir -p ./modules
+	@cp *.ko ./modules/ 2>/dev/null || echo "No .ko files to copy"
+	@if [ -f "$(VB2_CXL_DIR)/videobuf2-cxl.ko" ]; then \
+		echo "Installing VideoBuf2-CXL module..."; \
+		cp $(VB2_CXL_DIR)/videobuf2-cxl.ko ./modules/; \
+	fi
+	@if [ -f "$(VB2_NVME_CMB_DIR)/videobuf2-nvme-cmb.ko" ]; then \
+		echo "Installing VideoBuf2-NVMe-CMB module..."; \
+		cp $(VB2_NVME_CMB_DIR)/videobuf2-nvme-cmb.ko ./modules/; \
+	fi
+	@echo "Modules ready in ./modules/"
+	@ls -la ./modules/*.ko
+
+# Load V4L2 dependencies
+load-deps:
+	@echo "🔧 Loading required V4L2 dependencies..."
+	@for mod in videodev videobuf2-core videobuf2-v4l2 videobuf2-dma-contig videobuf2-memops; do \
+		if lsmod | grep -q "^$$mod "; then \
+			echo "✅ $$mod already loaded"; \
+		else \
+			if sudo modprobe $$mod 2>/dev/null; then \
+				echo "✅ $$mod loaded via modprobe"; \
+			else \
+				echo "⚠️  $$mod not available (may be built-in)"; \
+			fi; \
+		fi; \
+	done
+
+# Load VideoBuf2-CXL
+load-vb2-cxl:
+	@echo "🔧 Loading VideoBuf2-CXL module..."
+	@if [ -f "./modules/videobuf2-cxl.ko" ]; then \
+		if lsmod | grep -q "^videobuf2_cxl "; then \
+			echo "✅ videobuf2_cxl already loaded"; \
+		else \
+			echo "📦 Loading videobuf2-cxl.ko..."; \
+			if sudo insmod ./modules/videobuf2-cxl.ko; then \
+				echo "✅ Successfully loaded videobuf2-cxl"; \
+				sleep 1; \
+			else \
+				echo "❌ Failed to load videobuf2-cxl"; \
+				dmesg | tail -10; \
+				exit 1; \
+			fi; \
+		fi; \
 	else \
-		echo "⚠️  Configuration file not found, creating temporary one..."; \
-		echo "# AMD CSI2 V4L2 Driver Dependencies" > /tmp/amd_csi2.conf; \
-		echo "softdep amd_csi2_v4l2 pre: videodev videobuf2-core videobuf2-v4l2 videobuf2-dma-contig" >> /tmp/amd_csi2.conf; \
-		sudo cp /tmp/amd_csi2.conf /etc/modprobe.d/amd_csi2.conf; \
-		rm /tmp/amd_csi2.conf; \
-		echo "✅ Temporary configuration installed"; \
+		echo "❌ ERROR: VideoBuf2-CXL module not found!"; \
+		exit 1; \
 	fi
 
-# Remove modprobe configuration
-remove-config:
-	@echo "🗑️  Removing modprobe configuration..."
-	@sudo rm -f /etc/modprobe.d/amd_csi2.conf
-	@echo "✅ Configuration removed"
-
-# Check kernel config for V4L2 support
-check-kernel-config:
-	@echo "🔍 Checking Kernel V4L2 Configuration"
-	@echo "===================================="
-	@if [ -f /proc/config.gz ]; then \
-		echo "📋 V4L2 related config options:"; \
-		zcat /proc/config.gz | grep -E "CONFIG_(VIDEO|V4L2)" | head -10; \
-	elif [ -f /boot/config-$(shell uname -r) ]; then \
-		echo "📋 V4L2 related config options:"; \
-		grep -E "CONFIG_(VIDEO|V4L2)" /boot/config-$(shell uname -r) | head -10; \
-	else \
-		echo "❌ Kernel config not available"; \
+# Load VideoBuf2-NVMe-CMB
+load-vb2-nvme-cmb:
+	@echo "🔧 Loading VideoBuf2-NVMe-CMB module..."
+	@if [ -f "./modules/videobuf2-nvme-cmb.ko" ]; then \
+		if lsmod | grep -q "^videobuf2_nvme_cmb "; then \
+			echo "✅ videobuf2_nvme_cmb already loaded"; \
+		else \
+			echo "📦 Loading videobuf2-nvme-cmb.ko..."; \
+			if sudo insmod ./modules/videobuf2-nvme-cmb.ko; then \
+				echo "✅ Successfully loaded videobuf2-nvme-cmb"; \
+				sleep 1; \
+			else \
+				echo "⚠️  Failed to load videobuf2-nvme-cmb (continuing)"; \
+			fi; \
+		fi; \
 	fi
 
-# Try loading without dependencies (for testing)
-load-no-deps:
-	@echo "🚀 Loading driver without dependencies (test mode)..."
+# Load all modules
+load: load-params
+	@echo "Loading AMD CSI2 V4L2 driver ($(BUILD_MODE_STR) mode)..."
 	@if [ ! -f "./modules/amd_csi2_v4l2.ko" ]; then \
-		echo "Module not found, building first..."; \
-		$(MAKE) install-manual; \
+		echo "Modules not found, building first..."; \
+		$(MAKE) install; \
 	fi
-	@if lsmod | grep -q amd_csi2_v4l2; then \
-		echo "Driver already loaded, unloading first..."; \
+	@$(MAKE) load-deps
+	@$(MAKE) load-vb2-cxl
+	@$(MAKE) load-vb2-nvme-cmb
+	@if lsmod | grep -q "^amd_csi2_v4l2 "; then \
+		echo "Unloading existing amd_csi2_v4l2..."; \
 		sudo rmmod amd_csi2_v4l2 || true; \
 		sleep 1; \
 	fi
-	@echo "📦 Loading driver module (ignoring dependencies)..."
-	@if sudo insmod ./modules/amd_csi2_v4l2.ko; then \
-		echo "✅ Driver loaded successfully without dependencies"; \
-		echo "   This suggests the dependencies might be built-in"; \
+	@echo "📦 Loading amd_csi2_v4l2.ko..."
+	@MODULE_PARAMS=""; \
+	if [ "$(USE_CXL)" = "1" ] || [ "$(USE_CXL)" = "" ]; then \
+		MODULE_PARAMS="$$MODULE_PARAMS use_cxl_memory=1"; \
+	fi; \
+	if [ "$(USE_NVME)" = "1" ]; then \
+		MODULE_PARAMS="$$MODULE_PARAMS use_nvme_cmb=1"; \
+	fi; \
+	if [ -n "$(DEBUG)" ]; then \
+		MODULE_PARAMS="$$MODULE_PARAMS debug_level=$(DEBUG)"; \
+	fi; \
+	echo "  Parameters: $$MODULE_PARAMS"; \
+	if sudo insmod ./modules/amd_csi2_v4l2.ko $$MODULE_PARAMS; then \
+		echo "✅ Driver loaded successfully"; \
+		echo ""; \
+		lsmod | grep -E "(amd_csi2|videobuf2_cxl|videobuf2_nvme)"; \
+		echo ""; \
+		ls -la /dev/video* 2>/dev/null || echo "No video devices yet"; \
+		echo ""; \
+		dmesg | grep -E "(CSI2|CXL|NVMe)" | tail -10; \
 	else \
-		echo "❌ Driver load failed even without explicit dependency loading"; \
-		dmesg | tail -10; \
+		echo "❌ Driver load failed"; \
+		dmesg | tail -20; \
+		exit 1; \
 	fi
 
-# Force load with dependency resolution
-force-load:
-	@echo "🚀 Force loading with all methods..."
-	@$(MAKE) debug-symbols
-	@$(MAKE) force-load-deps
+# Load parameters help
+load-params:
+	@echo "Module parameters:"
+	@echo "  USE_CXL=$(USE_CXL) (default: 1)"
+	@echo "  USE_NVME=$(USE_NVME) (default: 0)"
+	@echo "  DEBUG=$(DEBUG) (default: 3)"
 	@echo ""
-	@echo "📦 Attempting driver load..."
-	@if sudo insmod ./modules/amd_csi2_v4l2.ko; then \
-		echo "✅ Success!"; \
-	else \
-		echo "❌ Failed - trying alternative approach..."; \
-		$(MAKE) load-no-deps; \
+
+# Unload all modules
+unload:
+	@echo "Unloading AMD CSI2 V4L2 driver..."
+	@if lsmod | grep -q "^amd_csi2_v4l2 "; then \
+		sudo rmmod amd_csi2_v4l2; \
+		echo "✅ AMD CSI2 driver unloaded"; \
+	fi
+	@if lsmod | grep -q "^videobuf2_nvme_cmb "; then \
+		sudo rmmod videobuf2-nvme-cmb; \
+		echo "✅ VideoBuf2-NVMe-CMB unloaded"; \
+	fi
+	@if lsmod | grep -q "^videobuf2_cxl "; then \
+		sudo rmmod videobuf2-cxl; \
+		echo "✅ VideoBuf2-CXL unloaded"; \
 	fi
 
-# Reload module (unload + load)
+# Reload modules
 reload: unload load
 
-# Show module info
-info:
-	modinfo amd_csi2_v4l2.ko
-
-# Show device status - enhanced for QEMU - MODIFIED
+# Status check
 status:
 	@echo "================================"
 	@echo "AMD CSI2 Driver Status"
 	@echo "================================"
 	@echo "Build mode: $(BUILD_MODE_STR)"
-	@echo "📋 Module Status:"
-	@if lsmod | grep -q amd_csi2; then \
-		lsmod | grep amd_csi2; \
-	else \
-		echo "  Driver not loaded"; \
-	fi
+	@echo "Kernel source: $(KERNEL_SRC)"
+	@echo "QEMU Guest: $(IS_QEMU)"
 	@echo ""
-	@echo "🔌 PCI Device Status:"
-	@if lspci | grep -q "AMD.*c901"; then \
-		lspci | grep "AMD.*c901"; \
-		echo "  Device found - OK"; \
-	else \
-		echo "  AMD CSI2 device not found"; \
-		echo "  All PCI devices:"; \
-		lspci | grep -i multimedia || echo "  No multimedia devices found"; \
-	fi
+	@echo "📋 Module Status:"
+	@lsmod | grep -E "(amd_csi2|videobuf2_cxl|videobuf2_nvme)" || echo "  No modules loaded"
+	@echo ""
+	@echo "🔌 PCI Devices:"
+	@echo "  CSI2 Device:"
+	@lspci -d 10ee:9024 2>/dev/null | head -1 || echo "    Not found"
+	@echo "  CXL Device:"
+	@lspci | grep -i "CXL\|0d93" | head -1 || echo "    Not found"
+	@echo "  NVMe Device:"
+	@lspci | grep -i "NVMe" | head -1 || echo "    Not found"
 	@echo ""
 	@echo "📹 Video Devices:"
 	@ls -la /dev/video* 2>/dev/null || echo "  No video devices found"
 	@echo ""
-	@echo "📊 Recent Kernel Messages:"
-	@dmesg | grep -i csi2 | tail -5 || echo "  No CSI2 messages in dmesg"
-	@echo ""
-	@echo "🔧 Build Files:"
-	@ls -la *.ko ./modules/*.ko 2>/dev/null || echo "  No module files found"
-
-# Debug target for troubleshooting
-debug:
-	@echo "================================"
-	@echo "AMD CSI2 Debug Information"
-	@echo "================================"
-	@echo "🏗️  Build Environment:"
-	@echo "  Build mode: $(BUILD_MODE_STR)"
-	@echo "  Kernel source: $(KDIR)"
-	@echo "  PWD: $(PWD)"
-	@echo "  Architecture: $(shell uname -m)"
-	@echo "  Kernel version: $(shell uname -r)"
-	@echo ""
-	@echo "📁 File System Info:"
-	@mount | grep -E "(9p|virtio)" || echo "  No 9p/virtio mounts found"
-	@echo ""
-	@echo "🔍 PCI Detailed Info:"
-	@lspci -vvv | grep -A 20 "AMD.*c901" || echo "  AMD CSI2 device not found"
-	@echo ""
-	@echo "📋 All Loaded Modules:"
-	@lsmod | head -10
-	@echo ""
-	@echo "⚠️  System Messages (last 10):"
-	@dmesg | tail -10
-
-# Test PCI device presence
-test-pci:
-	@echo "Testing PCI device presence..."
-	@if lspci -d 1022:c901 >/dev/null 2>&1; then \
-		echo "✅ AMD CSI2 device found"; \
-		lspci -d 1022:c901 -vvv; \
-	else \
-		echo "❌ AMD CSI2 device not found"; \
-		echo "Available PCI devices:"; \
-		lspci; \
-		exit 1; \
-	fi
-
-# Install target - adapted for QEMU environment
-install: all
-	@echo "Installing AMD CSI2 V4L2 driver..."
-	@if [ -w /lib/modules/$(shell uname -r)/extra ]; then \
-		sudo $(MAKE) -C $(KDIR) M=$(PWD) modules_install; \
-		sudo depmod -a; \
-		echo "Driver installed to system"; \
-	else \
-		echo "Creating local module directory..."; \
-		mkdir -p ./modules; \
-		cp *.ko ./modules/; \
-		echo "Driver copied to ./modules/ (manual insmod required)"; \
-		echo "Use: sudo insmod ./modules/amd_csi2_v4l2.ko"; \
-	fi
-
-# Manual install for QEMU environments
-install-manual: all
-	@echo "Manual installation for QEMU environment..."
-	mkdir -p ./modules
-	cp *.ko ./modules/
-	@echo "Module ready: ./modules/amd_csi2_v4l2.ko"
-	@echo "To load: sudo insmod ./modules/amd_csi2_v4l2.ko"
-	@echo "To unload: sudo rmmod amd_csi2_v4l2"
-
-# Uninstall target
-uninstall:
-	sudo rm -f /lib/modules/$(shell uname -r)/extra/amd_csi2_v4l2.ko
-	sudo depmod -a
-
-# Helper target to try loading a single module with multiple methods
-try-load-module:
-	@echo "🔍 Trying to load $(MODULE)..."
-	@if lsmod | grep -q "^$(MODULE) "; then \
-		echo "✅ $(MODULE) already loaded"; \
-	elif modprobe $(MODULE) 2>/dev/null; then \
-		echo "✅ $(MODULE) loaded via modprobe"; \
-	elif find /lib/modules/$(shell uname -r) -name "$(MODULE).ko*" 2>/dev/null | head -1 | xargs -r -I {} sh -c 'echo "Trying insmod {}" && insmod {} 2>/dev/null'; then \
-		echo "✅ $(MODULE) loaded via insmod"; \
-	else \
-		echo "⚠️  $(MODULE) not found or failed to load"; \
-		return 1; \
-	fi
-
-# Enhanced dependency loading with fallback options
-load-deps:
-	@echo "🔧 Loading required V4L2 dependencies..."
-	@echo "📍 Checking module availability..."
-	@# Check if modules exist in the system
-	@find /lib/modules/$(shell uname -r) -name "*video*" -type f 2>/dev/null | head -5 || echo "No video modules found in standard location"
-	@echo ""
-	@echo "🔄 Attempting to load dependencies with fallbacks..."
-	@# Try loading essential V4L2 modules
-	@for mod in videodev videobuf2-core videobuf2-v4l2 videobuf2-dma-contig; do \
-		$(MAKE) try-load-module MODULE=$$mod || echo "⚠️  $$mod not available (continuing)"; \
-	done
-	@echo ""
-	@echo "📋 Final dependency status:"
-	@lsmod | grep -E "(videodev|videobuf)" || echo "⚠️  No V4L2 modules loaded (driver may still work)"
-	@echo "✅ Dependency loading completed"
-
-# Enhanced load target with better error handling - MODIFIED
-load:
-	@echo "Loading AMD CSI2 V4L2 driver ($(BUILD_MODE_STR) mode)..."
-	@if [ ! -f "./modules/amd_csi2_v4l2.ko" ]; then \
-		echo "Module not found, building first..."; \
-		$(MAKE) install-manual; \
-	fi
-	@if lsmod | grep -q amd_csi2_v4l2; then \
-		echo "Driver already loaded, unloading first..."; \
-		sudo rmmod amd_csi2_v4l2 || true; \
-		sleep 1; \
-	fi
-	@# Load dependencies with improved error handling
-	@$(MAKE) load-deps
-	@echo ""
-	@echo "📦 Loading driver module..."
-	@if sudo insmod ./modules/amd_csi2_v4l2.ko; then \
-		echo "✅ Driver loaded successfully in $(BUILD_MODE_STR) mode"; \
-		echo "   Check with: lsmod | grep amd_csi2"; \
-		echo "   Device: ls -la /dev/video*"; \
-		dmesg | tail -5 | grep -i csi2 || echo "   No CSI2 messages in dmesg yet"; \
-	else \
-		echo "❌ Driver load failed"; \
-		echo "📋 Recent kernel messages:"; \
-		dmesg | tail -10; \
-		echo ""; \
-		echo "🔍 Detailed error analysis:"; \
-		$(MAKE) debug-load-failure; \
-		exit 1; \
-	fi
-
-# New target for analyzing load failures
-debug-load-failure:
-	@echo "🔍 Analyzing driver load failure..."
-	@echo "=================================="
-	@echo "📋 Missing symbols analysis:"
-	@if dmesg | tail -20 | grep -i "unknown symbol"; then \
-		echo "Found unknown symbol errors:"; \
-		dmesg | tail -20 | grep -i "unknown symbol"; \
-	else \
-		echo "No unknown symbol errors found"; \
-	fi
-	@echo ""
-	@echo "📦 Available V4L2 symbols:"
-	@if [ -d /proc/modules ]; then \
-		for mod in videodev videobuf2-core videobuf2-v4l2; do \
-			if lsmod | grep -q $$mod; then \
-				echo "✅ $$mod is loaded"; \
-			else \
-				echo "❌ $$mod is NOT loaded"; \
+	@echo "🔧 Memory Status:"
+	@if [ -d "/sys/class/vb2_cxl/" ]; then \
+		echo "  CXL Pools:"; \
+		for pool in /sys/class/vb2_cxl/cxl_pool_*; do \
+			if [ -e "$$pool/stats" ]; then \
+				echo "    $$(basename $$pool):"; \
+				cat $$pool/stats | sed 's/^/      /'; \
 			fi; \
 		done; \
-	fi
-	@echo ""
-	@echo "🔧 Suggested fixes:"
-	@echo "1. Try: make force-load-deps"
-	@echo "2. Try: make check-kernel-config"
-	@echo "3. Check: dmesg | grep -i v4l"
-
-# Force load dependencies from built-in modules
-force-load-deps:
-	@echo "🚀 Force loading V4L2 dependencies..."
-	@echo "Trying built-in kernel modules..."
-	@# Try to find and load modules from different locations
-	@for mod in videodev videobuf2-core videobuf2-v4l2 videobuf2-dma-contig; do \
-		echo "Force loading $$mod..."; \
-		if find /lib/modules/$(shell uname -r) -name "$$mod.ko*" -exec insmod {} \; 2>/dev/null; then \
-			echo "✅ $$mod loaded"; \
-		elif modprobe $$mod 2>/dev/null; then \
-			echo "✅ $$mod loaded via modprobe"; \
-		else \
-			echo "⚠️  $$mod not available"; \
-		fi; \
-	done
-	@echo "✅ Force loading completed"
-
-# Unload module
-unload:
-	@echo "Unloading AMD CSI2 V4L2 driver..."
-	@if lsmod | grep -q amd_csi2_v4l2; then \
-		sudo rmmod amd_csi2_v4l2; \
-		echo "Driver unloaded successfully"; \
 	else \
-		echo "Driver not currently loaded"; \
+		echo "  CXL pools not available"; \
 	fi
 
-# Debug missing symbols - enhanced
-debug-symbols:
-	@echo "🔍 Debugging Missing Symbols"
-	@echo "=========================="
-	@echo "📋 Current V4L2 modules status:"
-	@lsmod | grep -E "(videodev|videobuf)" || echo "  No V4L2 modules loaded"
+# Test CXL functionality
+test-cxl:
+	@echo "Testing CXL functionality..."
+	@echo "=== CXL Device Check ==="
+	@lspci -vvv -d 8086:0d93 2>/dev/null || echo "Intel CXL device not found"
 	@echo ""
-	@echo "📦 Checking available modules in kernel:"
-	@find /lib/modules/$(shell uname -r) -name "*video*" -o -name "*v4l*" | grep -E '\.ko' | sort || echo "  No V4L2 modules found"
-	@echo ""
-	@echo "🔧 Attempting to load V4L2 modules..."
-	@$(MAKE) force-load-deps
-	@echo ""
-	@echo "📋 Final V4L2 modules status:"
-	@lsmod | grep -E "(videodev|videobuf)" || echo "  Still no V4L2 modules loaded"
-	@echo ""
-	@echo "🔍 Kernel V4L2 support check:"
-	@if grep -q "CONFIG_VIDEO_DEV=y" /proc/config.gz 2>/dev/null || grep -q "CONFIG_VIDEO_DEV=y" /boot/config-$(shell uname -r) 2>/dev/null; then \
-		echo "✅ V4L2 support is built-in"; \
-	elif grep -q "CONFIG_VIDEO_DEV=m" /proc/config.gz 2>/dev/null || grep -q "CONFIG_VIDEO_DEV=m" /boot/config-$(shell uname -r) 2>/dev/null; then \
-		echo "✅ V4L2 support available as modules"; \
+	@echo "=== Module Parameters ==="
+	@if [ -d "/sys/module/amd_csi2_v4l2/parameters/" ]; then \
+		for param in /sys/module/amd_csi2_v4l2/parameters/*; do \
+			if [ -f "$$param" ]; then \
+				echo "$$(basename $$param): $$(cat $$param 2>/dev/null)"; \
+			fi; \
+		done; \
 	else \
-		echo "❌ V4L2 support may not be available"; \
+		echo "Module not loaded"; \
 	fi
 
-.PHONY: all polling interrupt clean install install-manual install-config remove-config uninstall load load-deps load-no-deps unload reload info status debug check-env test-pci debug-symbols force-load force-load-deps check-kernel-config debug-load-failure try-load-module
+# Test video capture
+test-capture:
+	@echo "Testing video capture..."
+	@if [ -e "/dev/video0" ]; then \
+		v4l2-ctl -d /dev/video0 --all; \
+		echo ""; \
+		echo "Attempting capture test (5 frames)..."; \
+		v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=5 --stream-to=/dev/null; \
+	else \
+		echo "No video device found"; \
+	fi
 
-# Help target - MODIFIED
+# Performance test
+perf-test:
+	@echo "Running performance test..."
+	@if [ -e "/dev/video0" ]; then \
+		echo "Capturing 300 frames (10 seconds at 30fps)..."; \
+		time v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=300 --stream-to=/dev/null; \
+	else \
+		echo "No video device found"; \
+	fi
+
+# Show kernel messages
+dmesg:
+	@echo "=== Recent kernel messages ==="
+	@dmesg | grep -E "(CSI2|CXL|NVMe|videobuf|P2P)" | tail -30
+
+# Full sequence
+full: clean all install load
+	@echo "✅ Full build and load completed"
+
+# Help
 help:
 	@echo "AMD CSI2 V4L2 Driver Makefile"
 	@echo "============================="
 	@echo ""
-	@echo "Build modes:"
-	@echo "  all              - Build in interrupt mode (default)"
-	@echo "  polling          - Build in polling mode"
-	@echo "  interrupt        - Build in interrupt mode (explicit)"
+	@echo "Build targets:"
+	@echo "  all              - Build all modules"
+	@echo "  clean            - Clean all build files"
+	@echo "  install          - Copy modules to ./modules/"
 	@echo ""
-	@echo "Available targets:"
-	@echo "  clean            - Clean build files"
-	@echo "  install          - Install driver (automatic detection)"
-	@echo "  install-manual   - Manual install for QEMU"
-	@echo "  load             - Load the driver module (with dependencies)"
-	@echo "  load-no-deps     - Load driver without explicit dependencies"
-	@echo "  force-load       - Force load with all available methods"
-	@echo "  unload           - Unload the driver module"
-	@echo "  reload           - Unload and load the driver"
-	@echo "  status           - Show driver and device status"
-	@echo "  debug            - Show detailed debug information"
-	@echo "  debug-symbols    - Debug V4L2 dependency issues"
-	@echo "  test-pci         - Test PCI device presence"
-	@echo "  info             - Show module information"
-	@echo "  help             - Show this help"
+	@echo "Module management:"
+	@echo "  load             - Load all modules"
+	@echo "  unload           - Unload all modules"
+	@echo "  reload           - Reload all modules"
+	@echo "  full             - Clean, build, install and load"
 	@echo ""
-	@echo "Build modes:"
-	@echo "  Interrupt mode: Uses MSI-X/legacy interrupts (default)"
-	@echo "  Polling mode:   Uses timer-based polling for debugging"
+	@echo "Parameters for 'make load':"
+	@echo "  USE_CXL=1        - Enable CXL memory (default: 1)"
+	@echo "  USE_NVME=1       - Enable NVMe CMB (default: 0)"
+	@echo "  DEBUG=<0-4>      - Set debug level (default: 3)"
 	@echo ""
-	@echo "QEMU Development Workflow:"
-	@echo "  1. make clean"
-	@echo "  2. make all          (or make polling for polling mode)"
-	@echo "  3. make load         (or make load-no-deps if deps fail)"
-	@echo "  4. make status"
+	@echo "Testing:"
+	@echo "  status           - Show driver status"
+	@echo "  test-cxl         - Test CXL functionality"
+	@echo "  test-capture     - Test video capture"
+	@echo "  perf-test        - Performance test"
+	@echo "  dmesg            - Show kernel messages"
 	@echo ""
-	@echo "Troubleshooting:"
-	@echo "  make debug-symbols   - Analyze dependency issues"
-	@echo "  make force-load      - Try all loading methods"
-	@echo "  make check-kernel-config - Check V4L2 kernel support"
-	@echo ""
-	@echo "Examples:"
-	@echo "  make polling load    - Build in polling mode and load"
-	@echo "  make interrupt load  - Build in interrupt mode and load"
+	@echo "Example: make load USE_CXL=1 USE_NVME=1 DEBUG=4"
+
+.PHONY: all clean install load unload reload status help full \
+        check-env build-cxl build-nvme-cmb build-csi2 \
+        load-deps load-vb2-cxl load-vb2-nvme-cmb load-params \
+        test-cxl test-capture perf-test dmesg
